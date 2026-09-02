@@ -1,6 +1,12 @@
 # ai-switch
 
-A small, secure command-line profile switcher for Codex and Claude Code. It works on headless servers and does not require administrator privileges.
+## The problem it solves
+
+When you use multiple coding agents and multiple model providers, changing providers separately in Claude Code and Codex is repetitive and error-prone. **ai-switch updates both agents in one command.**
+
+Choose a provider profile once, then activate it with `ai-switch use NAME`. The built-in GLM and DeepSeek presets already contain the provider-specific files, endpoints, protocols, model catalogs, and Claude Code mappings recommended by their official documentation. You only need to enter your API key. Custom OpenAI-compatible providers are supported too.
+
+This is a secure, headless-friendly command-line tool for servers without a desktop environment or administrator privileges.
 
 ## Install
 
@@ -36,10 +42,22 @@ export PATH="$HOME/.local/bin:$PATH"
 
 ## Quick start
 
-Save the configuration currently in use:
+Save the configuration currently in use as a fallback profile:
 
 ```bash
 ai-switch init default --description "Default daily configuration"
+```
+
+Create a ready-to-use mainstream provider profile interactively:
+
+```bash
+ai-switch add
+```
+
+Select `glm` or `deepseek`, enter the API key, and activate the generated configuration:
+
+```bash
+ai-switch use glm
 ```
 
 Edit `~/.codex/config.toml` and `~/.claude/settings.json` for another provider, then save that configuration as a second profile:

@@ -140,7 +140,7 @@ def add_interactive(_):
     print(f"Created profile: {name}. Activate it with: ai-switch use {name}")
 
 def main():
-    description = "Switch Codex and Claude Code API profiles without a GUI."
+    description = "Switch Claude Code and Codex between model providers in one command."
     epilog = """Examples:
   ai-switch init openai       Save the current configuration as 'openai'
   ai-switch list              List profiles (* marks the active one)
