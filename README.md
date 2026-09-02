@@ -4,6 +4,18 @@ A small, secure command-line profile switcher for Codex and Claude Code. It work
 
 ## Install
 
+Install from PyPI (recommended):
+
+```bash
+python3 -m pip install --user ai-switch-cli
+```
+
+For a system or virtual-environment install:
+
+```bash
+pip install ai-switch-cli
+```
+
 Install the latest development version directly from GitHub:
 
 ```bash
@@ -27,7 +39,7 @@ export PATH="$HOME/.local/bin:$PATH"
 Save the configuration currently in use:
 
 ```bash
-ai-switch init bairuo --description "Bairuo relay for daily work"
+ai-switch init default --description "Default daily configuration"
 ```
 
 Edit `~/.codex/config.toml` and `~/.claude/settings.json` for another provider, then save that configuration as a second profile:
@@ -48,7 +60,7 @@ ai-switch add
 Update an existing profile description:
 
 ```bash
-ai-switch describe bairuo "Bairuo relay for daily work"
+ai-switch describe default "Default daily configuration"
 ```
 
 `list` shows the active marker, profile name, configured clients, description, detected models, and endpoint hostnames. API keys are never printed.
