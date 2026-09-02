@@ -79,6 +79,8 @@ def use(name):
             if target.exists(): shutil.copy2(target, backup / target.name); secure(backup / target.name)
             write_atomic(target, source.read_text())
             print(f"Switched {label}")
+    if (d/"codex-config.toml").exists() and not (d/"codex-auth.json").exists():
+        print("Warning: profile has no Codex auth.json; run 'ai-switch init' again after configuring its API key.", file=sys.stderr)
     write_atomic(STATE, name + "\n")
     print(f"Active profile: {name}\nBackup: {backup}")
 
