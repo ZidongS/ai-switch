@@ -4,9 +4,22 @@ A small, secure command-line profile switcher for Codex and Claude Code. It work
 
 ## Install
 
+Install the latest development version directly from GitHub:
+
 ```bash
-chmod +x ai_switch.py
-ln -sf "$PWD/ai_switch.py" "$HOME/.local/bin/ai-switch"
+python3 -m pip install --user "git+https://github.com/ZidongS/ai-switch.git"
+```
+
+Or install a local checkout:
+
+```bash
+python3 -m pip install --user .
+```
+
+If `ai-switch` is not found afterwards, add the user script directory to `PATH`:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
 ```
 
 ## Quick start
