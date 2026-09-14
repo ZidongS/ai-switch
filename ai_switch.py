@@ -1,182 +1,1334 @@
 #!/usr/bin/env python3
-"""Switch Codex and Claude Code configuration profiles without a GUI."""
-import argparse, getpass, json, os, re, shutil, sys, tempfile, time
+"""ai-switch: one command to move Claude Code and Codex between model vendors.
+
+Model choice at activation time
+    A profile can describe several models (``models.json``).  ``ai-switch use``
+    lets you pick one and writes the choice to both agents: Codex gets the top
+    level ``model`` plus the whole model catalogue, Claude Code gets its default
+    model plus the Opus/Sonnet/Haiku mappings.  Model pickers inside the agents
+    keep working instead of being pinned to one model.
+
+        ai-switch use NAME                 pick a model (Enter accepts the default)
+        ai-switch use NAME --model glm-5.3 activate one model without prompting
+        ai-switch models NAME              show the models a profile offers
+
+Conversation history is never part of a profile
+    Sessions, rollouts, ``history.jsonl`` and the runtime SQLite databases are
+    owned by the agents.  ai-switch keeps them out of profiles and switches,
+    removes the stale model catalogue the previous provider left behind, and
+    ``ai-switch doctor`` reports the real reasons sessions disappear after a
+    switch (corrupt runtime SQLite databases, SQLite stored on NFS, disabled
+    history persistence, claude/codex running while switching).
+"""
+import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
 from pathlib import Path
 
+VERSION = "0.2.0"
+
+
+def _env_path(name, default):
+    value = os.environ.get(name)
+    return Path(value).expanduser() if value else default
+
+
 HOME = Path.home()
-CODEX = HOME / ".codex" / "config.toml"
-CLAUDE = HOME / ".claude" / "settings.json"
-CODEX_AUTH = HOME / ".codex" / "auth.json"
-CODEX_MODELS = HOME / ".codex" / "models.json"
-ROOT = Path(os.environ.get("AI_SWITCH_HOME", HOME / ".config" / "ai-switch"))
+CODEX_DIR = _env_path("CODEX_HOME", HOME / ".codex")
+CLAUDE_DIR = _env_path("CLAUDE_CONFIG_DIR", HOME / ".claude")
+CODEX = CODEX_DIR / "config.toml"
+CLAUDE = CLAUDE_DIR / "settings.json"
+CODEX_AUTH = CODEX_DIR / "auth.json"
+CODEX_MODELS = CODEX_DIR / "models.json"
+ROOT = _env_path("AI_SWITCH_HOME", HOME / ".config" / "ai-switch")
 PROFILES = ROOT / "profiles"
-STATE = ROOT / "current"
+CURRENT = ROOT / "current"
+STATE = ROOT / "state.json"
+QUARANTINE = ROOT / "quarantine"
 
-def secure(p):
-    try: p.chmod(0o700 if p.is_dir() else 0o600)
-    except OSError: pass
+# Files a profile may own.  Session/history/rollout/runtime-DB files are never
+# listed here on purpose: they belong to the agents, not to a provider profile.
+PROFILE_FILES = ("codex-config.toml", "claude-settings.json", "codex-auth.json", "codex-models.json")
 
-def write_atomic(path, data):
-    path.parent.mkdir(parents=True, exist_ok=True); secure(path.parent)
+# Claude Code environment variables that describe *which provider/model* is used.
+# They are replaced on every switch so the previous provider cannot leak into the
+# next one; everything else in ``env`` is left untouched.
+CLAUDE_STRUCTURAL_ENV = ("ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_API_KEY",
+                         "ANTHROPIC_CUSTOM_HEADERS", "API_TIMEOUT_MS",
+                         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+                         "CLAUDE_CODE_AUTO_COMPACT_WINDOW", "CLAUDE_CODE_EFFORT_LEVEL",
+                         "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "ANTHROPIC_EXTRA_BETAS")
+CLAUDE_MODEL_PINS = ("ANTHROPIC_MODEL", "ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                     "ANTHROPIC_DEFAULT_HAIKU_MODEL", "ANTHROPIC_SMALL_FAST_MODEL",
+                     "CLAUDE_CODE_SUBAGENT_MODEL", "ANTHROPIC_MODEL_ALIASES")
+CLAUDE_PROVIDER_ENV = CLAUDE_STRUCTURAL_ENV + CLAUDE_MODEL_PINS + ("CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
+
+GLM_ENDPOINT = "https://open.bigmodel.cn/api/v1"
+GLM_CLAUDE_ENDPOINT = "https://open.bigmodel.cn/api/anthropic"
+DEEPSEEK_ENDPOINT = "https://api.deepseek.com/"
+DEEPSEEK_CLAUDE_ENDPOINT = "https://api.deepseek.com/anthropic"
+
+NETWORK_FS = ("nfs", "nfs4", "cifs", "smb", "smb2", "smb3", "isilon", "lustre", "gpfs", "beegfs",
+              "glusterfs", "ceph", "9p", "afs", "davfs", "fuse.sshfs", "fuse.s3fs", "ncpfs", "ocfs2")
+
+
+# ---------------------------------------------------------------- small helpers
+def secure(path):
+    try:
+        path.chmod(0o700 if path.is_dir() else 0o600)
+    except OSError:
+        pass
+
+
+def write_atomic(path, data, mode=0o600):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    secure(path.parent)
     fd, tmp = tempfile.mkstemp(prefix=".tmp-", dir=str(path.parent))
     try:
-        with os.fdopen(fd, "w") as f: f.write(data)
-        os.chmod(tmp, 0o600); os.replace(tmp, path)
+        with os.fdopen(fd, "w") as handle:
+            handle.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
     finally:
-        if os.path.exists(tmp): os.unlink(tmp)
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+
+
+def read_text(path):
+    return path.read_text(errors="replace") if path.exists() else None
+
+
+def digest(data):
+    if isinstance(data, str):
+        data = data.encode()
+    return hashlib.sha256(data).hexdigest()
+
+
+def display_path(path):
+    try:
+        return "~/" + str(Path(path).relative_to(HOME))
+    except ValueError:
+        return str(path)
+
+
+def expand(path):
+    """Expand ``~`` against this tool's HOME instead of the process environment."""
+    text = str(path)
+    if text == "~":
+        return HOME
+    if text.startswith("~/"):
+        return HOME / text[2:]
+    return Path(text)
+
+
+def timestamp():
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def blank_profile_dir(path):
+    path.mkdir(parents=True, exist_ok=True)
+    secure(path)
+
+
+# ---------------------------------------------------------------- profile layout
+def targets():
+    """Live files a profile can control, keyed by their name inside the profile."""
+    return {"codex-config.toml": CODEX, "claude-settings.json": CLAUDE,
+            "codex-auth.json": CODEX_AUTH, "codex-models.json": CODEX_MODELS}
+
+
+def history_paths():
+    """Agent-owned state that must never be copied into or out of a profile."""
+    paths = [CODEX_DIR / "history.jsonl", CODEX_DIR / "session_index.jsonl",
+             CODEX_DIR / "sessions", CODEX_DIR / "archived_sessions",
+             CODEX_DIR / "thread_history_1.sqlite", CODEX_DIR / "version.json",
+             CLAUDE_DIR / "history.jsonl", CLAUDE_DIR / "projects", CLAUDE_DIR / "sessions",
+             CLAUDE_DIR / "session-env", CLAUDE_DIR / "file-history", CLAUDE_DIR / "todos",
+             HOME / ".claude.json"]
+    for pattern in ("state_*.sqlite", "logs_*.sqlite", "memories_*.sqlite", "goals_*.sqlite", "queue_*.sqlite",
+                    "state_*.sqlite-wal", "state_*.sqlite-shm", "logs_*.sqlite-wal", "logs_*.sqlite-shm"):
+        paths.extend(sorted(CODEX_DIR.glob(pattern)))
+    return paths
+
+
+def is_history_path(path):
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return False
+    for owned in history_paths():
+        try:
+            owned_resolved = owned.resolve()
+        except OSError:
+            continue
+        if resolved == owned_resolved or owned_resolved in resolved.parents:
+            return True
+    return False
+
 
 def profile(name):
-    if not name or Path(name).name != name or name in (".", ".."): raise ValueError("invalid profile name")
+    if not name or Path(name).name != name or name in (".", ".."):
+        raise ValueError("invalid profile name")
     return PROFILES / name
 
-def init(name):
-    d = profile(name); d.mkdir(parents=True, exist_ok=False); secure(d)
-    if CODEX.exists(): shutil.copy2(CODEX, d / "codex-config.toml")
-    if CLAUDE.exists(): shutil.copy2(CLAUDE, d / "claude-settings.json")
-    if CODEX_AUTH.exists(): shutil.copy2(CODEX_AUTH, d / "codex-auth.json")
-    if CODEX_MODELS.exists(): shutil.copy2(CODEX_MODELS, d / "codex-models.json")
-    for p in (d / "codex-config.toml", d / "claude-settings.json", d / "codex-auth.json", d / "codex-models.json"): secure(p)
-    write_atomic(d / "profile.json", json.dumps({"description": getattr(init, "description", ""), "created": time.strftime("%Y-%m-%d %H:%M:%S")}, ensure_ascii=True, indent=2) + "\n")
-    print(f"Created profile: {name}")
+
+def load_state():
+    try:
+        state = json.loads(STATE.read_text())
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(state):
+    write_atomic(STATE, json.dumps(state, indent=2) + "\n")
+
+
+def active_profile():
+    return CURRENT.read_text().strip() if CURRENT.exists() else ""
+
+
+def last_model(name):
+    models = load_state().get("models")
+    return models.get(name) if isinstance(models, dict) else None
+
+
+def profile_meta(d):
+    try:
+        meta = json.loads((d / "profile.json").read_text())
+        return meta if isinstance(meta, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+# ---------------------------------------------------------------- TOML fragments
+def split_toml(text):
+    """Split a TOML document into (top-level keys, sections)."""
+    match = re.search(r"(?m)^\[", text)
+    return (text, "") if not match else (text[:match.start()], text[match.start():])
+
+
+def top_level_get(text, key):
+    head, _ = split_toml(text)
+    match = re.search(r"(?m)^[ \t]*" + re.escape(key) + r"[ \t]*=[ \t]*(.+?)[ \t]*$", head)
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    if raw[:1] in ("'", '"'):
+        try:
+            return json.loads(raw)
+        except ValueError:
+            return raw[1:-1]
+    return raw
+
+
+def top_level_set(text, key, value, create=True):
+    head, tail = split_toml(text)
+    line = f"{key} = {json.dumps(value)}"
+    match = re.compile(r"(?m)^([ \t]*)" + re.escape(key) + r"[ \t]*=[^\n]*$")
+    if match.search(head):
+        head = match.sub(lambda _: line, head, count=1)
+    elif create:
+        if head and not head.endswith("\n"):
+            head += "\n"
+        head += line + "\n"
+    return head + tail
+
+
+def top_level_drop(text, key):
+    head, tail = split_toml(text)
+    head = re.sub(r"(?m)^[ \t]*" + re.escape(key) + r"[ \t]*=[^\n]*\n?", "", head)
+    return head + tail
+
+
+def section_value(text, section, key):
+    _, tail = split_toml(text)
+    match = re.search(r"(?ms)^\[" + re.escape(section) + r"\][ \t]*\n(.*?)(?=^\[|\Z)", tail)
+    if not match:
+        return None
+    found = re.search(r"(?m)^[ \t]*" + re.escape(key) + r"[ \t]*=[ \t]*(.+?)[ \t]*$", match.group(1))
+    return found.group(1).strip().strip("'\"") if found else None
+
+
+# ---------------------------------------------------------------- Claude settings
+def build_claude_settings(live, profile_settings, entry):
+    """Merge a profile's Claude settings into the live file.
+
+    Provider keys are owned by the profile and always replaced, so a switch can
+    never leave the previous endpoint, token or model behind.  Keys the agent
+    itself manages (``modelSettings``, ``availableModels``, onboarding flags,
+    ...) are kept from the live file so a switch does not reset the agent state.
+    """
+    profile_settings = profile_settings if isinstance(profile_settings, dict) else {}
+    out = {}
+    if isinstance(live, dict):
+        out.update({k: v for k, v in live.items() if k not in ("env", "model")})
+    out.update({k: v for k, v in profile_settings.items() if k != "env"})
+    live_env = live.get("env") if isinstance(live, dict) and isinstance(live.get("env"), dict) else {}
+    prof_env = profile_settings.get("env") if isinstance(profile_settings.get("env"), dict) else {}
+    env = {k: v for k, v in live_env.items() if k not in CLAUDE_PROVIDER_ENV}
+    env.update({k: v for k, v in prof_env.items() if k not in CLAUDE_MODEL_PINS})
+    if entry:
+        env.update(entry.get("claude", {}).get("env") or {})
+        out["model"] = entry["claude"].get("model") or entry["slug"]
+    elif "model" in profile_settings:
+        out["model"] = profile_settings["model"]
+    out["env"] = env
+    return out
+
+
+def substitute_model(value, old_slug, new_slug):
+    """``glm-5.3[1m]`` -> ``glm-5.3-flash[1m]`` when the base name matches."""
+    if not isinstance(value, str):
+        return value
+    base, _, suffix = value.partition("[")
+    return new_slug + ("[" + suffix if suffix else "") if base == old_slug else value
+
+
+def derive_claude_mapping(settings, default_slug, slug):
+    """Best-effort per-model Claude mapping for profiles that predate models.json."""
+    settings = settings if isinstance(settings, dict) else {}
+    env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    pins = {k: substitute_model(v, default_slug, slug) for k, v in env.items() if k in CLAUDE_MODEL_PINS}
+    pins.pop("ANTHROPIC_MODEL", None)  # a pinned main model blocks /model category switching
+    model = substitute_model(settings.get("model") or default_slug, default_slug, slug)
+    return {"model": model, "env": pins}
+
+
+# ---------------------------------------------------------------- model catalogue
+def codex_entry(slug, description, modalities, priority, context, effort):
+    return {"slug": slug, "display_name": slug, "description": description,
+            "default_reasoning_level": effort,
+            "supported_reasoning_levels": [{"effort": "low", "description": "Light reasoning"},
+                                            {"effort": "high", "description": "Enhanced reasoning"},
+                                            {"effort": "max", "description": "Deep reasoning"}],
+            "shell_type": "shell_command", "visibility": "list", "supported_in_api": True,
+            "priority": priority, "base_instructions": "", "supports_reasoning_summaries": True,
+            "default_reasoning_summary": "none", "support_verbosity": False,
+            "apply_patch_tool_type": "freeform", "truncation_policy": {"mode": "bytes", "limit": 10000},
+            "context_window": context, "max_context_window": context,
+            "effective_context_window_percent": 95, "supports_parallel_tool_calls": True,
+            "experimental_supported_tools": [], "input_modalities": list(modalities)}
+
+
+def claude_mapping(model, opus=None, sonnet=None, haiku=None, subagent=None):
+    env = {}
+    if opus:
+        env["ANTHROPIC_DEFAULT_OPUS_MODEL"] = opus
+    if sonnet:
+        env["ANTHROPIC_DEFAULT_SONNET_MODEL"] = sonnet
+    if haiku:
+        env["ANTHROPIC_DEFAULT_HAIKU_MODEL"] = haiku
+    if subagent:
+        env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
+    return {"model": model, "env": env}
+
+
+GLM_MODELS = [
+    {"slug": "glm-5.3", "label": "GLM-5.3 flagship (1M context)", "reasoning": "max",
+     "codex": codex_entry("glm-5.3", "Z.ai flagship coding model", ("text",), 0, 1048576, "max"),
+     "claude": claude_mapping("glm-5.3[1m]", opus="glm-5.3[1m]", sonnet="glm-5.3[1m]", haiku="glm-5.3-flash[1m]")},
+    {"slug": "glm-5.3-flash", "label": "GLM-5.3 flash (fast, 1M context)", "reasoning": "high",
+     "codex": codex_entry("glm-5.3-flash", "Z.ai fast model", ("text",), 1, 1048576, "high"),
+     "claude": claude_mapping("glm-5.3-flash[1m]", opus="glm-5.3-flash[1m]", sonnet="glm-5.3-flash[1m]",
+                              haiku="glm-5.3-flash[1m]")},
+]
+DEEPSEEK_MODELS = [
+    {"slug": "deepseek-v4-pro", "label": "DeepSeek V4 Pro (deep reasoning)", "reasoning": "max",
+     "codex": codex_entry("deepseek-v4-pro", "Deep reasoning DeepSeek model", ("text",), 1, 1048576, "high"),
+     "claude": claude_mapping("deepseek-v4-pro[1m]", opus="deepseek-v4-pro[1m]", sonnet="deepseek-v4-pro[1m]",
+                              haiku="deepseek-v4-flash", subagent="deepseek-v4-flash")},
+    {"slug": "deepseek-v4-flash", "label": "DeepSeek V4 Flash (fast, general purpose)", "reasoning": "high",
+     "codex": codex_entry("deepseek-v4-flash", "Fast general-purpose DeepSeek model", ("text",), 0, 1048576, "high"),
+     "claude": claude_mapping("deepseek-v4-flash[1m]", opus="deepseek-v4-flash[1m]",
+                              sonnet="deepseek-v4-flash[1m]", haiku="deepseek-v4-flash",
+                              subagent="deepseek-v4-flash")},
+    {"slug": "deepseek-v4-flash-vision-exp", "label": "DeepSeek V4 Flash Vision (image input)", "reasoning": "high",
+     "codex": codex_entry("deepseek-v4-flash-vision-exp", "DeepSeek vision model", ("text", "image"), 2, 1048576, "high"),
+     "claude": claude_mapping("deepseek-v4-flash-vision-exp", opus="deepseek-v4-flash-vision-exp",
+                              sonnet="deepseek-v4-flash-vision-exp", haiku="deepseek-v4-flash-vision-exp")},
+]
+
+PRESETS = {
+    "glm": {"endpoint": GLM_ENDPOINT, "claude_endpoint": GLM_CLAUDE_ENDPOINT,
+            "common_env": {"CLAUDE_CODE_AUTO_COMPACT_WINDOW": "1000000",
+                           "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": 1,
+                           "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1", "API_TIMEOUT_MS": "3000000"},
+            "models": GLM_MODELS, "default": "glm-5.3",
+            "codex_template": ('model_provider = "ZAI"\nmodel = "@MODEL@"\nmodel_reasoning_effort = "@EFFORT@"\n'
+                               'model_catalog_json = "@CATALOG@"\n\n[model_providers.ZAI]\nname = "ZAI"\n'
+                               'base_url = "@ENDPOINT@"\nexperimental_bearer_token = "@KEY@"\n'
+                               'wire_api = "responses"\n')},
+    "deepseek": {"endpoint": DEEPSEEK_ENDPOINT, "claude_endpoint": DEEPSEEK_CLAUDE_ENDPOINT,
+                 "common_env": {"CLAUDE_CODE_EFFORT_LEVEL": "max", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
+                                "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"},
+                 "models": DEEPSEEK_MODELS, "default": "deepseek-v4-flash",
+                 "codex_template": ('model = "@MODEL@"\nmodel_provider = "deepseek"\npreferred_auth_method = "apikey"\n'
+                                    'forced_login_method = "api"\nmodel_reasoning_effort = "@EFFORT@"\n'
+                                    'model_catalog_json = "@CATALOG@"\n\n[model_providers.deepseek]\nname = "deepseek"\n'
+                                    'base_url = "@ENDPOINT@"\nwire_api = "responses"\n'
+                                    'experimental_bearer_token = "@KEY@"\n')},
+}
+
+
+def normalise_catalog(raw, profile_settings=None, provider=None):
+    """Turn any profile-side description of models into a catalogue dict."""
+    if not isinstance(raw, dict):
+        return None
+    models = [m for m in raw.get("models") or [] if isinstance(m, dict) and m.get("slug")]
+    if not models:
+        return None
+    default = raw.get("default") or models[0]["slug"]
+    return {"version": 2, "provider": raw.get("provider") or provider or "", "default": default,
+            "models": models, "settings": profile_settings, "open_ended": bool(raw.get("open_ended"))}
+
+
+def load_catalog(d, profile_settings=None):
+    """Return the selectable models of a profile, or None for legacy profiles.
+
+    ``models.json`` is authoritative.  ``codex-models.json`` (written by older
+    releases) is accepted and upgraded in memory so existing profiles get the
+    picker without being rewritten.
+    """
+    if profile_settings is None:
+        profile_settings = parse_json_file(d / "claude-settings.json")
+    path = d / "models.json"
+    if path.exists():
+        try:
+            catalog = normalise_catalog(json.loads(path.read_text()), profile_settings)
+            if catalog:
+                return catalog
+        except ValueError:
+            pass
+    catalog_path = d / "codex-models.json"
+    if not catalog_path.exists():
+        return None
+    try:
+        raw = json.loads(catalog_path.read_text())
+    except ValueError:
+        return None
+    entries = raw.get("models") if isinstance(raw, dict) else raw
+    if not isinstance(entries, list):
+        return None
+    settings = profile_settings if isinstance(profile_settings, dict) else {}
+    default_slug = (settings.get("model") or "").split("[")[0]
+    models = []
+    for entry in entries:
+        if not isinstance(entry, dict) or not entry.get("slug"):
+            continue
+        slug = entry["slug"]
+        models.append({"slug": slug, "label": entry.get("description") or entry.get("display_name") or "",
+                       "reasoning": entry.get("default_reasoning_level") or "",
+                       "codex": entry, "claude": derive_claude_mapping(settings, default_slug or slug, slug)})
+    if not models:
+        return None
+    slugs = [m["slug"] for m in models]
+    return {"version": 2, "provider": "", "default": default_slug if default_slug in slugs else slugs[0],
+            "models": models, "settings": settings}
+
+
+def find_entry(catalog, slug):
+    if not catalog or not slug:
+        return None
+    for entry in catalog["models"]:
+        if entry["slug"] == slug:
+            return entry
+    return None
+
+
+def resolve_model(catalog, token):
+    entries = catalog["models"]
+    token = str(token).strip()
+    if token.isdigit():
+        index = int(token)
+        if 1 <= index <= len(entries):
+            return entries[index - 1]["slug"]
+        raise ValueError(f"model index out of range: {token}")
+    for entry in entries:
+        if entry["slug"].lower() == token.lower():
+            return entry["slug"]
+    matches = [e["slug"] for e in entries if e["slug"].lower().startswith(token.lower())]
+    if len(matches) == 1:
+        return matches[0]
+    available = ", ".join(e["slug"] for e in entries)
+    raise ValueError(f"unknown model '{token}'; this profile offers: {available}")
+
+
+def pick_model(catalog, requested, fallback, assume_yes=False):
+    """Choose the model to activate (no prompting when requested/non-interactive)."""
+    if not catalog:
+        return requested
+    entries = catalog["models"]
+    slugs = [e["slug"] for e in entries]
+    if requested:
+        return resolve_model(catalog, requested)
+    if fallback not in slugs:
+        fallback = catalog["default"] if catalog["default"] in slugs else slugs[0]
+    if assume_yes or not sys.stdin.isatty() or len(entries) == 1:
+        return fallback
+    print(f"This profile provides {len(entries)} models:")
+    for index, entry in enumerate(entries, 1):
+        mark = "  [default]" if entry["slug"] == fallback else ""
+        print(f"  {index}) {entry['slug']:<28} {entry.get('label', '')}{mark}")
+    while True:
+        try:
+            raw = input(f"Select model [1-{len(entries)}, Enter={fallback}, q=cancel]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise KeyboardInterrupt
+        if not raw:
+            return fallback
+        if raw.lower() in ("q", "quit", "cancel"):
+            raise KeyboardInterrupt
+        try:
+            return resolve_model(catalog, raw)
+        except ValueError as error:
+            print(f"  {error}")
+
+
+# ---------------------------------------------------------------- switching
+def catalog_target(text, catalog_path):
+    """Honour a profile's own model_catalog_json path when it declares one."""
+    declared = top_level_get(text, "model_catalog_json") if text else None
+    if declared:
+        return expand(declared)
+    return catalog_path
+
+
+def build_codex_catalog(d, catalog):
+    """Union of the profile's catalog file and every selectable model entry."""
+    entries = {}
+    try:
+        raw = json.loads((d / "codex-models.json").read_text())
+        for entry in (raw.get("models") if isinstance(raw, dict) else raw) or []:
+            if isinstance(entry, dict) and entry.get("slug"):
+                entries[entry["slug"]] = entry
+    except (OSError, ValueError, AttributeError):
+        pass
+    for entry in catalog["models"]:
+        if isinstance(entry.get("codex"), dict):
+            entries[entry["slug"]] = entry["codex"]
+    if not entries:
+        return None
+    ordered = [entries[e["slug"]] for e in catalog["models"] if e["slug"] in entries]
+    ordered += [v for k, v in sorted(entries.items()) if v not in ordered]
+    return {"models": ordered}
+
+
+def compute_changes(d, slug):
+    """Return {path: text-or-None}: None means "remove this stale file"."""
+    changes, notes = {}, []
+    catalog = load_catalog(d)
+    entry = find_entry(catalog, slug)
+    state = load_state()
+    previously_written = state.get("files") if isinstance(state.get("files"), dict) else {}
+
+    text = read_text(d / "codex-config.toml")
+    codex_catalog = None
+    if text is not None:
+        # Open-ended providers (custom endpoints) are not pinned to a catalogue;
+        # everything else publishes every selectable model so the picker inside
+        # Codex lists them all.
+        if catalog and (not catalog.get("open_ended") or (d / "codex-models.json").exists()):
+            codex_catalog = build_codex_catalog(d, catalog)
+        if codex_catalog is not None:
+            catalog_path = catalog_target(text, CODEX_MODELS)
+            changes[catalog_path] = json.dumps(codex_catalog, indent=2) + "\n"
+            if top_level_get(text, "model_catalog_json") is None:
+                text = top_level_set(text, "model_catalog_json", display_path(catalog_path))
+        elif top_level_get(text, "model_catalog_json"):
+            declared = catalog_target(text, CODEX_MODELS)
+            if not declared.exists():
+                # Never leave the configuration pointing at a catalogue that is not there.
+                text = top_level_drop(text, "model_catalog_json")
+                notes.append("dropped the model_catalog_json reference to the missing "
+                             f"{display_path(declared)}; Codex uses its built-in model list")
+        if slug:
+            text = top_level_set(text, "model", slug)
+            if entry and entry.get("reasoning"):
+                text = top_level_set(text, "model_reasoning_effort", entry["reasoning"])
+        elif entry:
+            text = top_level_set(text, "model", entry["slug"])
+        changes[CODEX] = text
+    elif (d / "codex-auth.json").exists() or (d / "codex-models.json").exists():
+        notes.append("profile has Codex side files but no codex-config.toml")
+
+    claude_file = d / "claude-settings.json"
+    if claude_file.exists():
+        profile_settings = parse_json_file(claude_file)
+        live = parse_json_file(CLAUDE)
+        changes[CLAUDE] = json.dumps(build_claude_settings(live, profile_settings, entry), indent=2) + "\n"
+    else:
+        notes.append("profile does not configure Claude Code; ~/.claude/settings.json is left untouched")
+
+    if (d / "codex-config.toml").exists() and not (d / "codex-auth.json").exists():
+        notes.append("profile has no codex-auth.json; re-run 'ai-switch init' after setting the API key")
+
+    # A profile that does not publish a catalogue must not inherit the previous
+    # provider's one: a leftover catalogue makes Codex treat the new provider's
+    # models as unknown, and sessions using them cannot be resumed.
+    if text is not None and codex_catalog is None:
+        stale = CODEX_MODELS
+        recorded = previously_written.get(str(stale))
+        current = read_text(stale)
+        if recorded and recorded != "removed" and stale not in changes:
+            if current is not None and digest(current) == recorded:
+                changes[stale] = None
+                notes.append(f"removes the stale {display_path(stale)} left over from the previous provider")
+            elif current is not None:
+                notes.append(f"{display_path(stale)} was modified by hand and is left untouched")
+    return changes, notes
+
+
+def parse_json_file(path):
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def backup_dir():
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = ROOT / "backups" / stamp
+    counter = 1
+    while backup.exists():
+        counter += 1
+        backup = ROOT / "backups" / f"{stamp}-{counter}"
+    return backup
+
+
+def keep_copy(backup, path):
+    backup.mkdir(parents=True, exist_ok=True)
+    secure(backup)
+    shutil.copy2(path, backup / path.name)
+    secure(backup / path.name)
+
+
+def apply_changes(changes, name, slug, dry_run=False):
+    backup = backup_dir()
+    written, backed_up = {}, 0
+    for path in sorted(changes, key=str):
+        data = changes[path]
+        label = f"remove {display_path(path)}" if data is None else f"write {display_path(path)}"
+        if dry_run:
+            print(f"dry-run: would {label}")
+            continue
+        if is_history_path(path):
+            raise ValueError(f"refusing to manage agent history file: {path}")
+        if data is None:
+            if path.exists():
+                removed = backup / "removed"
+                removed.mkdir(parents=True, exist_ok=True)
+                secure(removed)
+                shutil.move(str(path), str(removed / path.name))
+                backed_up += 1
+                written[str(path)] = "removed"
+            print(f"Removed {display_path(path)}")
+            continue
+        if path.exists():
+            keep_copy(backup, path)
+            backed_up += 1
+        write_atomic(path, data)
+        written[str(path)] = digest(data)
+        print(f"Wrote {display_path(path)}")
+    if not dry_run:
+        state = load_state()
+        models = state.get("models") if isinstance(state.get("models"), dict) else {}
+        if slug:
+            models[name] = slug
+        state.update({"profile": name, "models": models, "files": written, "updated": timestamp()})
+        save_state(state)
+        write_atomic(CURRENT, name + "\n")
+    return backup if backed_up else None
+
+
+def codex_health_warnings(check_codex=True):
+    """Cheap pre-switch check so lost sessions are explained, not mysterious."""
+    warnings = []
+    if check_codex:
+        for db in sorted(CODEX_DIR.glob("state_*.sqlite")) + sorted(CODEX_DIR.glob("thread_history_*.sqlite")):
+            status, detail = sqlite_status(db)
+            if status != "ok":
+                warnings.append(f"Codex runtime DB {db.name} is unusable ({detail}) - sessions may be missing "
+                                "from the resume picker; run 'ai-switch doctor --fix'")
+    running = running_agents()
+    if running:
+        warnings.append("running now: " + ", ".join(running) +
+                        " - restart them after switching, a running agent rewrites its config on exit")
+    return warnings
+
+
+def cmd_use(args):
+    name = args.name
+    d = profile(name)
+    if not d.is_dir():
+        raise FileNotFoundError(f"profile not found: {name}")
+    if not any((d / profile_file).exists() for profile_file in PROFILE_FILES):
+        raise ValueError(f"profile '{name}' has no Codex or Claude configuration to activate")
+    catalog = load_catalog(d)
+    fallback = args.model or last_model(name) or (catalog or {}).get("default")
+    if catalog and args.model and catalog.get("open_ended"):
+        try:
+            slug = resolve_model(catalog, args.model)
+        except ValueError:
+            slug = args.model
+            print(f"Note: '{args.model}' is not in the profile's model list; using it as-is.", file=sys.stderr)
+    else:
+        slug = pick_model(catalog, args.model, fallback, assume_yes=args.yes)
+    if slug and catalog is None:
+        print(f"Note: profile '{name}' has no model list, using '{slug}' as-is.", file=sys.stderr)
+    changes, notes = compute_changes(d, slug)
+    for note in notes:
+        print(f"Note: {note}", file=sys.stderr)
+    backup = apply_changes(changes, name, slug, dry_run=args.dry_run)
+    if not args.dry_run:
+        print(f"Active profile: {name}" + (f"\nActive model: {slug}" if slug else ""))
+        print(f"Backup: {backup}" if backup else "Backup: nothing to back up (no files existed yet)")
+        print("Restart claude/codex so they reload their configuration.")
+        if not args.no_check:
+            for warning in codex_health_warnings((d / "codex-config.toml").exists()):
+                print(f"Warning: {warning}", file=sys.stderr)
+    return 0
+
+
+# ---------------------------------------------------------------- commands
+def cmd_init(args):
+    d = profile(args.name)
+    d.mkdir(parents=True, exist_ok=False)
+    secure(d)
+    copied = []
+    for profile_file, target in targets().items():
+        if target.exists():
+            shutil.copy2(target, d / profile_file)
+            secure(d / profile_file)
+            copied.append(profile_file)
+    catalog, settings = None, parse_json_file(d / "claude-settings.json")
+    if not args.no_import:
+        catalog = load_catalog(d, settings)
+        if catalog:
+            models = []
+            for entry in catalog["models"]:
+                models.append({"slug": entry["slug"], "label": entry.get("label", ""),
+                               "reasoning": entry.get("reasoning", ""),
+                               "codex": entry.get("codex"), "claude": entry.get("claude")})
+            write_atomic(d / "models.json", json.dumps({"version": 2, "provider": "",
+                                                        "default": catalog["default"], "models": models},
+                                                       indent=2) + "\n")
+    write_atomic(d / "profile.json", json.dumps({"description": args.description,
+                                                 "created": timestamp(), "files": copied}, indent=2) + "\n")
+    print(f"Created profile: {args.name}")
+    if catalog:
+        print(f"Imported {len(catalog['models'])} model(s): " + ", ".join(m["slug"] for m in catalog["models"]))
+    print(f"Activate it with: ai-switch use {args.name}")
+    return 0
+
+
+def cmd_list(_):
+    current = active_profile()
+    for d in sorted(PROFILES.iterdir() if PROFILES.exists() else []):
+        if not d.is_dir():
+            continue
+        desc, clients, details = summary(d)
+        print(f"{'*' if d.name == current else ' '} {d.name:<16} {clients:<12} {desc} [{details}]")
+    return 0
+
 
 def summary(d):
-    meta = {}
-    try: meta = json.loads((d / "profile.json").read_text())
-    except (OSError, ValueError): pass
-    clients=[]; details=[]
-    c=d/"codex-config.toml"
-    if c.exists():
+    meta = profile_meta(d)
+    clients, details = [], []
+    text = read_text(d / "codex-config.toml")
+    if text is not None:
         clients.append("Codex")
-        s=c.read_text(errors="replace")
-        model=re.search(r'^model\s*=\s*["\']([^"\']+)',s,re.M)
-        base=re.search(r'^base_url\s*=\s*["\']([^"\']+)',s,re.M)
-        if model: details.append("Codex model="+model.group(1))
-        if base: details.append("Codex endpoint="+base.group(1).split('/')[2] if '://' in base.group(1) else "Codex endpoint configured")
-    c=d/"claude-settings.json"
-    if c.exists():
+        model = top_level_get(text, "model")
+        base = top_level_get(text, "base_url") or _provider_base_url(text)
+        if model:
+            details.append("Codex model=" + str(model))
+        if base:
+            details.append("Codex endpoint=" + host_of(base))
+    settings = parse_json_file(d / "claude-settings.json")
+    if settings:
         clients.append("Claude")
-        try:
-            x=json.loads(c.read_text()); env=x.get("env",{}); model=x.get("model")
-            if model: details.append("Claude model="+str(model))
-            if env.get("ANTHROPIC_BASE_URL"): details.append("Claude endpoint="+str(env["ANTHROPIC_BASE_URL"]).split('/')[2] if '://' in str(env["ANTHROPIC_BASE_URL"]) else "Claude endpoint configured")
-        except ValueError: details.append("Claude settings invalid JSON")
-    return meta.get("description") or "No description", ",".join(clients) or "No config", "; ".join(details) or "No automatic summary"
+        if settings.get("model"):
+            details.append("Claude model=" + str(settings["model"]))
+        base = (settings.get("env") or {}).get("ANTHROPIC_BASE_URL")
+        if base:
+            details.append("Claude endpoint=" + host_of(base))
+    catalog = load_catalog(d, settings)
+    if catalog:
+        details.append(f"{len(catalog['models'])} model(s)")
+    return (meta.get("description") or "No description", ",".join(clients) or "No config",
+            "; ".join(details) or "No automatic summary")
 
-def list_profiles(_):
-    current = STATE.read_text().strip() if STATE.exists() else ""
-    for d in sorted(PROFILES.iterdir() if PROFILES.exists() else []):
-        if d.is_dir():
-            desc, clients, details = summary(d)
-            print(f"{'*' if d.name == current else ' '} {d.name:<16} {clients:<12} {desc} [{details}]")
 
-def use(name):
+def _provider_base_url(text):
+    _, tail = split_toml(text)
+    found = re.search(r'(?m)^base_url[ \t]*=[ \t]*["\']([^"\']+)', tail)
+    return found.group(1) if found else None
+
+
+def host_of(url):
+    text = str(url)
+    return text.split("/")[2] if "://" in text and len(text.split("/")) > 2 else text
+
+
+def claude_model_pins(settings):
+    env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    return {key: env.get(key) for key in ("ANTHROPIC_DEFAULT_OPUS_MODEL", "ANTHROPIC_DEFAULT_SONNET_MODEL",
+                                          "ANTHROPIC_DEFAULT_HAIKU_MODEL") if env.get(key)}
+
+
+def cmd_models(args):
+    name = args.name or active_profile()
+    if not name:
+        raise ValueError("no active profile; pass a profile name")
     d = profile(name)
-    if not d.is_dir(): raise FileNotFoundError(f"profile not found: {name}")
-    backup = ROOT / "backups" / time.strftime("%Y%m%d-%H%M%S")
-    backup.mkdir(parents=True, exist_ok=True); secure(backup)
-    for target, source, label in ((CODEX,d/"codex-config.toml","Codex"),(CLAUDE,d/"claude-settings.json","Claude"),(CODEX_AUTH,d/"codex-auth.json","Codex auth"),(CODEX_MODELS,d/"codex-models.json","Codex models")):
-        if source.exists():
-            if target.exists(): shutil.copy2(target, backup / target.name); secure(backup / target.name)
-            write_atomic(target, source.read_text())
-            print(f"Switched {label}")
-    if (d/"codex-config.toml").exists() and not (d/"codex-auth.json").exists():
-        print("Warning: profile has no Codex auth.json; run 'ai-switch init' again after configuring its API key.", file=sys.stderr)
-    write_atomic(STATE, name + "\n")
-    print(f"Active profile: {name}\nBackup: {backup}")
+    if not d.is_dir():
+        raise FileNotFoundError(f"profile not found: {name}")
+    catalog = load_catalog(d, parse_json_file(d / "claude-settings.json"))
+    current = last_model(name) if name == active_profile() else None
+    if not catalog:
+        text = read_text(d / "codex-config.toml") or ""
+        model = top_level_get(text, "model")
+        if args.json:
+            print(json.dumps({"profile": name, "models": ([model] if model else [])}, indent=2))
+        else:
+            print(f"Profile '{name}' has no model list." + (f" Codex model: {model}" if model else ""))
+            print("Add one with 'ai-switch add' or 'ai-switch upgrade %s'." % name)
+        return 0
+    if args.json:
+        print(json.dumps({"profile": name, "default": catalog["default"], "active": current,
+                          "models": [{"slug": e["slug"], "label": e.get("label", ""),
+                                      "claude_model": (e.get("claude") or {}).get("model")}
+                                     for e in catalog["models"]]}, indent=2))
+        return 0
+    print(f"Profile '{name}' - default {catalog['default']}, {len(catalog['models'])} model(s):")
+    for index, entry in enumerate(catalog["models"], 1):
+        marks = []
+        if entry["slug"] == catalog["default"]:
+            marks.append("default")
+        if entry["slug"] == current:
+            marks.append("active")
+        claude_model = (entry.get("claude") or {}).get("model")
+        suffix = f"  -> Claude {claude_model}" if claude_model else ""
+        print(f"  {index}) {entry['slug']:<30} {entry.get('label', '')}"
+              f"{('  [' + ', '.join(marks) + ']') if marks else ''}{suffix}")
+    return 0
 
-def current(_): print(STATE.read_text().strip() if STATE.exists() else "(none)")
 
-def describe(name, text):
-    d=profile(name)
-    if not d.is_dir(): raise FileNotFoundError(f"profile not found: {name}")
-    write_atomic(d/"profile.json", json.dumps({"description": text, "updated": time.strftime("%Y-%m-%d %H:%M:%S")}, ensure_ascii=True, indent=2)+"\n")
-    print(f"Updated description: {name}")
+def cmd_current(_):
+    print(active_profile() or "(none)")
+    return 0
 
-def add_interactive(_):
-    print("Create a provider profile (input is not echoed for API keys).")
+
+def cmd_describe(args):
+    d = profile(args.name)
+    if not d.is_dir():
+        raise FileNotFoundError(f"profile not found: {args.name}")
+    meta = profile_meta(d)
+    meta.update({"description": args.text, "updated": timestamp()})
+    write_atomic(d / "profile.json", json.dumps(meta, indent=2) + "\n")
+    print(f"Updated description: {args.name}")
+    return 0
+
+
+def cmd_upgrade(args):
+    """Give a profile written by an older release an explicit model list."""
+    d = profile(args.name)
+    if not d.is_dir():
+        raise FileNotFoundError(f"profile not found: {args.name}")
+    if (d / "models.json").exists() and not args.force:
+        print(f"Profile '{args.name}' already has models.json (use --force to rebuild it).")
+        return 0
+    settings = parse_json_file(d / "claude-settings.json")
+    catalog = load_catalog(d, settings)
+    if not catalog:
+        raise ValueError(f"profile '{args.name}' has no codex-models.json to build a model list from")
+    models = []
+    for entry in catalog["models"]:
+        models.append({"slug": entry["slug"], "label": entry.get("label", ""), "reasoning": entry.get("reasoning", ""),
+                       "codex": entry.get("codex"), "claude": entry.get("claude")})
+    write_atomic(d / "models.json", json.dumps({"version": 2, "provider": catalog.get("provider", ""),
+                                               "default": catalog["default"], "models": models}, indent=2) + "\n")
+    print(f"Upgraded '{args.name}': {len(models)} model(s) - " + ", ".join(m["slug"] for m in models))
+    print(f"Pick one with: ai-switch use {args.name}")
+    return 0
+
+
+def _ask(prompt, default=""):
+    suffix = f" (default: {default})" if default else ""
+    try:
+        answer = input(f"{prompt}{suffix}: ").strip()
+    except EOFError:
+        raise KeyboardInterrupt
+    return answer or default
+
+
+def ask_secret(prompt="API key: "):
+    """Read a secret from the same stream as the other prompts, without echo.
+
+    ``getpass`` opens /dev/tty, which breaks piped/scripted input (the answers
+    already buffered on stdin are invisible to it) and fails outright when no
+    terminal is attached.  Set AI_SWITCH_API_KEY to skip the prompt entirely.
+    """
+    override = os.environ.get("AI_SWITCH_API_KEY")
+    if override:
+        return override.strip()
+    try:
+        import termios
+        fd = sys.stdin.fileno()
+        saved = termios.tcgetattr(fd) if sys.stdin.isatty() else None
+    except (ImportError, OSError, ValueError, AttributeError):
+        termios, fd, saved = None, None, None
+    print(prompt, end="", flush=True)
+    try:
+        if saved is not None:
+            quiet = list(saved)
+            quiet[3] &= ~termios.ECHO
+            termios.tcsetattr(fd, termios.TCSADRAIN, quiet)
+        line = sys.stdin.readline()
+    finally:
+        if saved is not None:
+            termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        print()
+    if not line:
+        raise KeyboardInterrupt
+    return line.strip()
+
+
+def cmd_add(_):
+    print("Create a provider profile (API keys are not echoed).")
     print("At any prompt, type 'cancel' or press Ctrl-C to exit without saving.\n")
-    provider=input("Provider [glm/deepseek/custom] (default: glm): ").strip().lower() or "glm"
-    if provider not in ("glm","deepseek","custom"): raise ValueError("provider must be glm, deepseek, or custom")
-    if provider == "glm":
-        endpoint="https://open.bigmodel.cn/api/v1"; model="glm-5.3"; claude_endpoint="https://open.bigmodel.cn/api/anthropic"
-        print("Using GLM preset: Codex Responses API and Claude model mappings will be configured automatically.")
-    elif provider == "deepseek":
-        endpoint="https://api.deepseek.com/"; model="deepseek-v4-flash"; claude_endpoint="https://api.deepseek.com/anthropic"
-        print("Using DeepSeek preset: Codex Responses API, model catalog, and Claude model mappings will be configured automatically.")
+    provider = _ask("Provider [glm/deepseek/custom]", "glm").lower()
+    if provider not in ("glm", "deepseek", "custom"):
+        raise ValueError("provider must be glm, deepseek, or custom")
+    preset = PRESETS.get(provider)
+    key = ask_secret()
+    if preset:
+        chosen = preset["models"]
+        print(f"{provider} preset offers: " + ", ".join(m["slug"] for m in chosen))
+        wanted = _ask("Models to include (comma separated, Enter=all)", "all")
+        if wanted.lower() not in ("all", ""):
+            names = [part.strip() for part in wanted.split(",") if part.strip()]
+            by_slug = {m["slug"]: m for m in chosen}
+            chosen = []
+            for token in names:
+                slug = [s for s in by_slug if s.lower().startswith(token.lower())]
+                if len(slug) != 1:
+                    raise ValueError(f"unknown model '{token}'")
+                chosen.append(by_slug[slug[0]])
+        default = _ask("Default model", chosen[0]["slug"])
+        default = resolve_model({"models": chosen}, default)
+        endpoint, claude_endpoint = preset["endpoint"], preset["claude_endpoint"]
+        common_env = dict(preset["common_env"])
     else:
-        endpoint=input("API endpoint URL (e.g. https://api.example.com/v1): ").strip()
-        model=input("Model name: ").strip(); claude_endpoint=endpoint[:-3].rstrip("/") if endpoint.endswith("/v1") else endpoint.rstrip("/")
-    name=input("Profile name: ").strip(); desc=input("Description: ").strip()
-    key=getpass.getpass("API key: ")
-    clients=input("Configure clients [both/codex/claude] (default: both): ").strip().lower() or "both"
-    if clients not in ("both","codex","claude"): raise ValueError("clients must be both, codex, or claude")
-    d=profile(name); d.mkdir(parents=True, exist_ok=False); secure(d)
-    if clients in ("both","codex"):
-        if provider == "glm":
-            base='model_provider = "ZAI"\nmodel = "glm-5.3"\nmodel_reasoning_effort = "max"\nmodel_catalog_json = "~/.codex/models.json"\n\n[model_providers.ZAI]\nname = "ZAI"\nbase_url = "https://open.bigmodel.cn/api/v1"\nexperimental_bearer_token = "'+key+'"\nwire_api = "responses"\n'
-        elif provider == "deepseek":
-            base='model = "deepseek-v4-flash"\nmodel_provider = "deepseek"\npreferred_auth_method = "apikey"\nforced_login_method = "api"\nmodel_reasoning_effort = "high"\nmodel_catalog_json = "~/.codex/models.json"\n\n[model_providers.deepseek]\nname = "deepseek"\nbase_url = "https://api.deepseek.com/"\nwire_api = "responses"\nexperimental_bearer_token = "'+key+'"\n'
-        else: base=CODEX.read_text() if CODEX.exists() else 'model_provider = "custom"\nmodel = "MODEL"\n\n[model_providers.custom]\nname = "custom"\nbase_url = "ENDPOINT"\nwire_api = "responses"\nrequires_openai_auth = true\n'
-        base=re.sub(r'(?m)^model\s*=\s*["\'][^"\']*["\']', f'model = "{model}"', base, count=1)
-        base=re.sub(r'(?m)^base_url\s*=\s*["\'][^"\']*["\']', f'base_url = "{endpoint}"', base, count=1)
-        write_atomic(d/"codex-config.toml", base)
-        write_atomic(d/"codex-auth.json", json.dumps({"OPENAI_API_KEY":key}, indent=2)+"\n")
-        if provider in ("glm", "deepseek"):
-            if provider == "deepseek":
-                models=[]
-                for slug, desc, modalities, priority, context in (("deepseek-v4-flash","Fast general-purpose DeepSeek model",["text"],0,1048576),("deepseek-v4-pro","Deep reasoning DeepSeek model",["text"],1,1048576),("deepseek-v4-flash-vision-exp","DeepSeek vision model",["text","image"],2,1048576)):
-                    models.append({"slug":slug,"display_name":slug,"description":desc,"default_reasoning_level":"high","supported_reasoning_levels":[{"effort":"low","description":"Light reasoning"},{"effort":"high","description":"Enhanced reasoning"},{"effort":"max","description":"Deep reasoning"}],"shell_type":"shell_command","visibility":"list","supported_in_api":True,"priority":priority,"base_instructions":"","supports_reasoning_summaries":True,"default_reasoning_summary":"none","support_verbosity":False,"apply_patch_tool_type":"freeform","truncation_policy":{"mode":"bytes","limit":10000},"context_window":context,"max_context_window":context,"effective_context_window_percent":95,"supports_parallel_tool_calls":True,"experimental_supported_tools":[],"input_modalities":modalities})
-                write_atomic(d/"codex-models.json", json.dumps({"models":models}, indent=2)+"\n")
-            else:
-                catalog={"models":[{"slug":"glm-5.3","display_name":"glm-5.3","description":"Z.ai flagship model","default_reasoning_level":"max","supported_reasoning_levels":[{"effort":"low","description":"Light reasoning"},{"effort":"high","description":"Enhanced reasoning"},{"effort":"max","description":"Deep reasoning"}],"shell_type":"shell_command","visibility":"list","supported_in_api":True,"priority":0,"base_instructions":"","supports_reasoning_summaries":True,"default_reasoning_summary":"none","support_verbosity":False,"apply_patch_tool_type":"freeform","truncation_policy":{"mode":"bytes","limit":10000},"context_window":1048576,"max_context_window":1048576,"effective_context_window_percent":95,"supports_parallel_tool_calls":True,"experimental_supported_tools":[],"input_modalities":["text"]}]}
-                write_atomic(d/"codex-models.json", json.dumps(catalog, indent=2)+"\n")
-    if clients in ("both","claude"):
-        obj=json.loads(CLAUDE.read_text()) if CLAUDE.exists() else {}
-        obj.setdefault("env",{}).update({"ANTHROPIC_BASE_URL":claude_endpoint,"ANTHROPIC_AUTH_TOKEN":key})
-        if provider == "glm": obj["env"].update({"ANTHROPIC_DEFAULT_HAIKU_MODEL":"glm-5.3-flash[1m]","ANTHROPIC_DEFAULT_SONNET_MODEL":"glm-5.3[1m]","ANTHROPIC_DEFAULT_OPUS_MODEL":"glm-5.3[1m]","CLAUDE_CODE_AUTO_COMPACT_WINDOW":"1000000","CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC":1,"API_TIMEOUT_MS":"3000000"})
-        elif provider == "deepseek": obj["env"].update({"ANTHROPIC_MODEL":"deepseek-v4-pro[1m]","ANTHROPIC_DEFAULT_OPUS_MODEL":"deepseek-v4-pro[1m]","ANTHROPIC_DEFAULT_SONNET_MODEL":"deepseek-v4-pro[1m]","ANTHROPIC_DEFAULT_HAIKU_MODEL":"deepseek-v4-flash","CLAUDE_CODE_SUBAGENT_MODEL":"deepseek-v4-flash","CLAUDE_CODE_EFFORT_LEVEL":"max","CLAUDE_CODE_AUTO_COMPACT_WINDOW":"786432"})
-        obj["model"]=model; write_atomic(d/"claude-settings.json", json.dumps(obj, indent=2)+"\n")
-    write_atomic(d/"profile.json", json.dumps({"description":desc,"created":time.strftime("%Y-%m-%d %H:%M:%S")}, indent=2)+"\n")
-    print(f"Created profile: {name}. Activate it with: ai-switch use {name}")
+        endpoint = _ask("API endpoint URL (e.g. https://api.example.com/v1)")
+        if not endpoint:
+            raise ValueError("an endpoint URL is required")
+        claude_endpoint = endpoint[:-3].rstrip("/") if endpoint.endswith("/v1") else endpoint.rstrip("/")
+        slug = _ask("Model name")
+        if not slug:
+            raise ValueError("a model name is required")
+        chosen = [{"slug": slug, "label": "custom model", "reasoning": "",
+                   "codex": codex_entry(slug, "custom model", ("text",), 0, 1048576, "high"),
+                   "claude": claude_mapping(slug)}]
+        default, common_env = slug, {}
+    name = _ask("Profile name")
+    if not name:
+        raise ValueError("a profile name is required")
+    desc = _ask("Description")
+    clients = _ask("Configure clients [both/codex/claude]", "both").lower()
+    if clients not in ("both", "codex", "claude"):
+        raise ValueError("clients must be both, codex, or claude")
+    sqlite_home = ""
+    if clients in ("both", "codex") and fstype_for(CODEX_DIR) in NETWORK_FS:
+        suggested = f"/var/tmp/codex-sqlite-{os.environ.get('USER', 'user')}"
+        print(f"\n{CODEX_DIR} is on a network filesystem ({fstype_for(CODEX_DIR)}); SQLite runtime databases "
+              "can be corrupted there, which makes sessions disappear.")
+        sqlite_home = _ask("Local directory for Codex runtime databases (Enter=leave default)", suggested)
+    d = profile(name)
+    blank_profile_dir(d)
+    catalog = {"version": 2, "provider": provider, "default": default, "models": chosen,
+               "open_ended": provider == "custom"}
+    write_atomic(d / "models.json", json.dumps(catalog, indent=2) + "\n")
+    entry = find_entry(catalog, default)
+    if clients in ("both", "codex"):
+        if preset:
+            catalog_path = CODEX_MODELS
+            base = (preset["codex_template"].replace("@MODEL@", default)
+                    .replace("@EFFORT@", entry.get("reasoning") or "high")
+                    .replace("@CATALOG@", display_path(catalog_path))
+                    .replace("@ENDPOINT@", preset["endpoint"]).replace("@KEY@", key))
+        else:
+            # A custom endpoint usually serves models we cannot know about, so no
+            # catalogue is written: Codex keeps listing the models the endpoint has.
+            base = (f'model = "{default}"\nmodel_provider = "custom"\npreferred_auth_method = "apikey"\n'
+                    f'forced_login_method = "api"\n\n[model_providers.custom]\nname = "custom"\n'
+                    f'base_url = "{endpoint}"\nwire_api = "responses"\n'
+                    f'requires_openai_auth = true\nexperimental_bearer_token = "{key}"\n')
+        if sqlite_home:
+            base += f'\n# Keeps Codex runtime SQLite databases off the network filesystem.\nsqlite_home = "{display_path(expand(sqlite_home))}"\n'
+        write_atomic(d / "codex-config.toml", base)
+        if preset:
+            write_atomic(d / "codex-models.json", json.dumps(build_codex_catalog(d, catalog), indent=2) + "\n")
+        write_atomic(d / "codex-auth.json", json.dumps({"OPENAI_API_KEY": key}, indent=2) + "\n")
+    if clients in ("both", "claude"):
+        env = {"ANTHROPIC_BASE_URL": claude_endpoint, "ANTHROPIC_AUTH_TOKEN": key}
+        env.update(common_env)
+        write_atomic(d / "claude-settings.json", json.dumps(build_claude_settings(None, {"env": env}, entry),
+                                                            indent=2) + "\n")
+    write_atomic(d / "profile.json", json.dumps({"description": desc, "created": timestamp(),
+                                                 "provider": provider, "default_model": default}, indent=2) + "\n")
+    print(f"\nCreated profile: {name}")
+    print(f"Activate it with: ai-switch use {name}   (choose between {len(chosen)} model(s))")
+    return 0
 
-def main():
+
+# ---------------------------------------------------------------- health checks
+SQLITE_COPY_LIMIT = 256 * 1024 * 1024
+
+
+def _verdict(row, note=""):
+    if row and row[0] == "ok":
+        return "ok", "integrity ok" + note
+    detail = " ".join(" ".join(str(part).split()) for part in (row or []) if part).strip() or "no result"
+    return "broken", detail
+
+
+def _sqlite_direct(path):
+    for suffix in ("?mode=ro", "?mode=ro&immutable=1"):
+        try:
+            connection = sqlite3.connect(f"file:{Path(path).as_uri()}{suffix}", uri=True)
+            try:
+                return connection.execute("PRAGMA quick_check(1)").fetchone(), None
+            finally:
+                connection.close()
+        except sqlite3.Error as error:
+            last = str(error)
+    return None, last
+
+
+def _sqlite_snapshot(path):
+    """Check a copy of the database (plus its WAL) in a local writable directory.
+
+    Reading a live database can be refused on a network filesystem or a read-only
+    mount; the copy is then the faithful view the agent itself gets.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        return "broken", str(error)
+    sidecars = [Path(str(path) + suffix) for suffix in ("-wal", "-shm")]
+    for side in sidecars:
+        if side.exists():
+            size += side.stat().st_size
+    if size > SQLITE_COPY_LIMIT:
+        return "skipped", f"too large to snapshot ({size // (1024 * 1024)} MiB)"
+    try:
+        with tempfile.TemporaryDirectory(prefix="ai-switch-db-") as tmp:
+            copy = Path(tmp) / path.name
+            shutil.copy2(path, copy)
+            for side in sidecars:
+                if side.exists():
+                    shutil.copy2(side, Path(str(copy) + side.name[len(path.name):]))
+            connection = sqlite3.connect(str(copy))
+            try:
+                row = connection.execute("PRAGMA quick_check(1)").fetchone()
+            finally:
+                connection.close()
+            return _verdict(row, " (checked on a snapshot copy)")
+    except (OSError, sqlite3.Error) as error:
+        return "broken", str(error)
+
+
+def sqlite_status(path):
+    """Return ("ok"|"broken"|"missing"|"skipped", detail)."""
+    if not path.exists():
+        return "missing", "file not found"
+    row, error = _sqlite_direct(path)
+    if row is not None:
+        return _verdict(row)
+    status, detail = _sqlite_snapshot(path)
+    if status == "broken" and not detail:
+        detail = error or "unreadable"
+    return status, detail
+
+
+def fstype_for(path):
+    try:
+        resolved = Path(path).expanduser().resolve()
+    except OSError:
+        return ""
+    best, best_len = "", -1
+    try:
+        with open("/proc/mounts", "r", errors="replace") as handle:
+            lines = handle.readlines()
+    except OSError:
+        return ""
+    for line in lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        mount = Path(parts[1].replace("\\040", " "))
+        if resolved == mount or mount in resolved.parents:
+            if len(str(mount)) > best_len:
+                best, best_len = parts[2], len(str(mount))
+    return best
+
+
+def running_agents():
+    names = []
+    try:
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/comm", "r", errors="replace") as handle:
+                    comm = handle.read().strip()
+            except OSError:
+                continue
+            if re.fullmatch(r"(claude|codex)(\.exe)?", comm):
+                names.append(f"{comm} (pid {entry})")
+    except OSError:
+        pass
+    return names
+
+
+def check_report():
+    checks = []
+
+    def add(status, title, detail, hint=""):
+        checks.append({"status": status, "title": title, "detail": detail, "hint": hint})
+
+    for label, path in (("CODEX_HOME", CODEX_DIR), ("Claude config", CLAUDE_DIR), ("ai-switch home", ROOT)):
+        fs_type = fstype_for(path) or "unknown"
+        if fs_type in NETWORK_FS:
+            add("warn", f"{label} is on {fs_type}", f"{path} ({fs_type})",
+                "SQLite databases (Codex runtime state, goals, memories, logs) can be corrupted on network "
+                "filesystems, which makes sessions disappear. Point CODEX_SQLITE_HOME at a local disk, e.g. "
+                f"export CODEX_SQLITE_HOME=/var/tmp/codex-sqlite-$USER")
+        else:
+            add("ok", f"{label} filesystem", f"{path} ({fs_type})")
+
+    text = read_text(CODEX) or ""
+    persisted = section_value(text, "history", "persistence")
+    if persisted and persisted.lower() in ("none", "off", "false"):
+        add("fail", "Codex history persistence is disabled",
+            f"[history] persistence = \"{persisted}\" in {display_path(CODEX)}",
+            "Rollouts are not written, so past sessions cannot be resumed. Remove that setting.")
+    else:
+        add("ok", "Codex history persistence", persisted or "default (enabled)")
+
+    model = top_level_get(text, "model")
+    catalog_path = top_level_get(text, "model_catalog_json")
+    live_catalog = parse_json_file(expand(catalog_path)) if catalog_path else parse_json_file(CODEX_MODELS)
+    slugs = [e.get("slug") for e in (live_catalog.get("models") or []) if isinstance(e, dict)]
+    if catalog_path and not expand(catalog_path).exists():
+        add("fail", "Codex model catalogue is missing", f"{catalog_path} does not exist",
+            "Re-run 'ai-switch use <profile>' to rewrite it.")
+    elif slugs and model and model not in slugs:
+        add("fail", "Codex model catalogue does not contain the configured model",
+            f"model = {model}, catalogue has {', '.join(str(s) for s in slugs)}",
+            "Codex refuses to resume sessions whose model is unknown. Re-run 'ai-switch use <profile>'.")
+    elif slugs:
+        add("ok", "Codex model catalogue", f"{len(slugs)} model(s): {', '.join(str(s) for s in slugs)}")
+    else:
+        add("ok", "Codex model catalogue", "not used by the current configuration")
+
+    databases = sorted(CODEX_DIR.glob("*.sqlite"))
+    broken = []
+    for db in databases:
+        status, detail = sqlite_status(db)
+        if status != "ok":
+            broken.append((db, detail))
+    if broken:
+        for db, detail in broken:
+            add("fail", f"Codex runtime DB {db.name} is unusable", detail,
+                "Codex rebuilds this database from the rollout files when it is moved aside: "
+                "'ai-switch doctor --fix', then restart codex.")
+    elif databases:
+        add("ok", "Codex runtime databases", f"{len(databases)} database(s) passed quick_check")
+    else:
+        add("note", "Codex runtime databases", "none found")
+    for sidecar in sorted(CODEX_DIR.glob("*.sqlite-wal")) + sorted(CODEX_DIR.glob("*.sqlite-shm")):
+        if not Path(str(sidecar).rsplit("-", 1)[0]).exists():
+            add("warn", f"orphan {sidecar.name}", "main database is gone; it is ignored by Codex")
+
+    sessions = sorted((CODEX_DIR / "sessions").glob("**/*.jsonl")) if (CODEX_DIR / "sessions").exists() else []
+    newest = max((s.stat().st_mtime for s in sessions), default=None)
+    if sessions:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(newest))
+        add("ok", "Codex rollout files", f"{len(sessions)} rollout(s), newest {when}",
+            "Run 'codex resume --all' to list sessions from every directory ('codex resume' filters by cwd).")
+    else:
+        add("note", "Codex rollout files", "none found", "Sessions start once you use codex.")
+    for name in ("history.jsonl", "session_index.jsonl"):
+        path = CODEX_DIR / name
+        add("ok" if path.exists() else "note", f"Codex {name}",
+            f"{display_path(path)} ({path.stat().st_size} bytes)" if path.exists() else "not created yet")
+
+    settings = parse_json_file(CLAUDE)
+    env = settings.get("env") if isinstance(settings.get("env"), dict) else {}
+    pins = claude_model_pins(settings)
+    if env.get("ANTHROPIC_MODEL"):
+        add("warn", "Claude Code model is pinned by the environment",
+            f"ANTHROPIC_MODEL={env['ANTHROPIC_MODEL']}",
+            "A pinned model overrides the settings.json model and disables /model category switching. "
+            "Switch with 'ai-switch use <profile>' instead.")
+    elif pins:
+        distinct = len(set(pins.values()))
+        detail = ", ".join(f"{k.split('_')[2]}={v}" for k, v in pins.items())
+        add("ok" if distinct > 1 else "warn", "Claude Code model categories", detail,
+            "" if distinct > 1 else "Opus/Sonnet/Haiku all map to the same model, so /model has no effect. "
+                                    "Re-create the profile with 'ai-switch add' to get distinct mappings.")
+    else:
+        add("note", "Claude Code model categories", "no provider mappings in settings.json")
+    history = CLAUDE_DIR / "history.jsonl"
+    projects = CLAUDE_DIR / "projects"
+    transcripts = sorted(projects.glob("*/*.jsonl")) if projects.exists() else []
+    add("ok" if history.exists() else "note", "Claude prompt history",
+        f"{display_path(history)} ({history.stat().st_size} bytes)" if history.exists() else "not created yet")
+    add("ok" if transcripts else "note", "Claude transcripts",
+        f"{len(transcripts)} transcript(s) under {display_path(projects)}")
+
+    state = load_state()
+    add("ok", "Active profile", f"{active_profile() or '(none)'}"
+        + (f", model {state.get('models', {}).get(active_profile())}" if isinstance(state.get("models"), dict)
+           and state.get("models", {}).get(active_profile()) else ""))
+    profiles = [p.name for p in sorted(PROFILES.iterdir()) if p.is_dir()] if PROFILES.exists() else []
+    add("ok" if profiles else "note", "Profiles", ", ".join(profiles) or "none yet")
+
+    running = running_agents()
+    if running:
+        add("warn", "Agents are running", ", ".join(running),
+            "A running agent rewrites its configuration on exit and may overwrite the switch; restart it after switching.")
+    else:
+        add("ok", "No agent processes running", "config.toml / settings.json are not being rewritten")
+    return checks
+
+
+def quarantine_broken_databases(checks, out=print):
+    broken = [c for c in checks if c["status"] == "fail" and c["title"].startswith("Codex runtime DB")]
+    if not broken:
+        out("Nothing to fix: no damaged Codex runtime database found.")
+        return 0
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = QUARANTINE / stamp
+    target.mkdir(parents=True, exist_ok=True)
+    secure(target)
+    for check in broken:
+        name = check["title"].split("Codex runtime DB ")[1].split(" ")[0]
+        base = CODEX_DIR / name
+        for path in (base, Path(str(base) + "-wal"), Path(str(base) + "-shm")):
+            if path.exists():
+                shutil.move(str(path), str(target / path.name))
+                out(f"Quarantined {display_path(path)} -> {display_path(target / path.name)}")
+    out("\nRestart codex: it rebuilds the runtime database from the rollout files, which brings "
+        "resumable sessions back. Rollouts and history.jsonl were not touched.")
+    return 0
+
+
+def cmd_doctor(args):
+    checks = check_report()
+    if args.json:
+        print(json.dumps({"version": VERSION, "checks": checks}, indent=2))
+    else:
+        symbols = {"ok": "\u2713", "warn": "!", "fail": "\u2717", "note": "-"}
+        for check in checks:
+            print(f"  {symbols.get(check['status'], '?')} {check['title']}: {check['detail']}")
+            if check["hint"]:
+                print(f"      -> {check['hint']}")
+        failed = sum(1 for c in checks if c["status"] == "fail")
+        warned = sum(1 for c in checks if c["status"] == "warn")
+        print(f"\n{len(checks) - failed - warned} ok, {warned} warning(s), {failed} failure(s)")
+        print("Session history is never part of a profile: ai-switch only manages "
+              + ", ".join(PROFILE_FILES) + ".")
+    if args.fix:
+        if not args.json:
+            print()
+        quarantine_broken_databases(checks, out=(lambda text="": print(text, file=sys.stderr)) if args.json else print)
+    return 1 if any(c["status"] == "fail" for c in checks) else 0
+
+
+# ---------------------------------------------------------------- entry point
+def main(argv=None):
     description = "Switch Claude Code and Codex between model providers in one command."
     epilog = """Examples:
-  ai-switch init openai       Save the current configuration as 'openai'
-  ai-switch list              List profiles (* marks the active one)
-  ai-switch use glm           Activate the 'glm' profile
-  ai-switch current           Show the active profile
+  ai-switch init openai          Save the current configuration as 'openai'
+  ai-switch list                 List profiles (* marks the active one)
+  ai-switch use glm              Activate 'glm' and choose which model to use
+  ai-switch use glm -m glm-5.3   Activate a specific model without prompting
+  ai-switch models glm           Show the models a profile offers
+  ai-switch upgrade glm          Add a model list to a profile from an older release
+  ai-switch doctor               Check configuration and session-history health
+  ai-switch doctor --fix         Quarantine damaged Codex runtime databases
 
-Profiles: ~/.config/ai-switch/profiles/
-Backups:  ~/.config/ai-switch/backups/
-Set AI_SWITCH_HOME to override the storage directory.
-After switching, restart claude/codex so they reload their configuration."""
-    ap=argparse.ArgumentParser(prog="ai-switch", description=description,
-                               epilog=epilog, formatter_class=argparse.RawDescriptionHelpFormatter)
-    sp=ap.add_subparsers(dest="cmd")
-    p=sp.add_parser("init", help="save current Codex/Claude config as a new profile", description="Save the current configuration files as a new profile.")
-    p.add_argument("name", help="profile name (letters, numbers, . _ -; no path separators)")
-    p.add_argument("-d", "--description", default="", help="human-readable purpose, e.g. 'GLM Coding Plan'")
-    p.set_defaults(fn=init)
-    p=sp.add_parser("list", help="list all profiles", description="List profiles; '*' marks the active profile."); p.set_defaults(fn=list_profiles)
-    p=sp.add_parser("use", help="activate a profile", description="Back up current files and atomically activate the selected profile.")
-    p.add_argument("name", help="profile name"); p.set_defaults(fn=use)
-    p=sp.add_parser("current", help="show active profile", description="Print the active profile name, or '(none)'."); p.set_defaults(fn=current)
-    p=sp.add_parser("describe", help="set a profile description", description="Update the human-readable description of an existing profile.")
-    p.add_argument("name", help="profile name"); p.add_argument("text", help="description"); p.set_defaults(fn=None)
-    p=sp.add_parser("add", help="create a profile interactively", description="Interactively create a profile without editing configuration files."); p.set_defaults(fn=add_interactive)
-    a=ap.parse_args()
-    if not a.cmd:
-        ap.print_help()
+Profiles: ~/.config/ai-switch/profiles/    Backups: ~/.config/ai-switch/backups/
+Environment: AI_SWITCH_HOME, CODEX_HOME, CLAUDE_CONFIG_DIR, CODEX_SQLITE_HOME
+
+ai-switch never reads or writes session, rollout or history files; only the
+files inside a profile are switched. Restart claude/codex after switching."""
+    parser = argparse.ArgumentParser(prog="ai-switch", description=description, epilog=epilog,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--version", action="version", version=f"ai-switch {VERSION}")
+    sub = parser.add_subparsers(dest="cmd")
+
+    p = sub.add_parser("init", help="save the current Codex/Claude config as a new profile")
+    p.add_argument("name")
+    p.add_argument("-d", "--description", default="")
+    p.add_argument("--no-import", action="store_true", help="do not derive a model list from the snapshot")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("list", help="list all profiles")
+    p.set_defaults(fn=cmd_list)
+
+    p = sub.add_parser("use", help="activate a profile (optionally choosing a model)")
+    p.add_argument("name")
+    p.add_argument("-m", "--model", help="model to activate (name, unique prefix, or 1-based index)")
+    p.add_argument("-y", "--yes", action="store_true", help="never prompt; use the default model")
+    p.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
+    p.add_argument("--no-check", action="store_true", help="skip the session-history health check")
+    p.set_defaults(fn=cmd_use)
+
+    p = sub.add_parser("models", help="show the models a profile offers")
+    p.add_argument("name", nargs="?")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_models)
+
+    p = sub.add_parser("current", help="show the active profile")
+    p.set_defaults(fn=cmd_current)
+
+    p = sub.add_parser("describe", help="set a profile description")
+    p.add_argument("name")
+    p.add_argument("text")
+    p.set_defaults(fn=cmd_describe)
+
+    p = sub.add_parser("upgrade", help="derive a model list for a profile from an older release")
+    p.add_argument("name")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(fn=cmd_upgrade)
+
+    p = sub.add_parser("add", help="create a profile interactively (GLM, DeepSeek, or custom)")
+    p.set_defaults(fn=cmd_add)
+
+    p = sub.add_parser("doctor", help="check configuration, model catalogues and session history")
+    p.add_argument("--fix", action="store_true", help="quarantine damaged Codex runtime databases")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(fn=cmd_doctor)
+
+    args = parser.parse_args(argv)
+    if not args.cmd:
+        parser.print_help()
         print("\nAvailable profiles:")
-        list_profiles(a)
+        cmd_list(args)
         return 0
-    if a.cmd == "init": init.description = a.description
-    if a.cmd == "describe": a.fn = lambda n: describe(n, a.text)
-    try: a.fn(getattr(a,"name",a))
+    try:
+        return args.fn(args)
     except KeyboardInterrupt:
-        print("\nCancelled. No profile was created.", file=sys.stderr)
+        print("\nCancelled. Nothing was changed.", file=sys.stderr)
         return 130
-    except (OSError, ValueError) as e: print(f"Error: {e}", file=sys.stderr); return 1
-    return 0
-if __name__ == "__main__": raise SystemExit(main())
+    except (OSError, ValueError, FileNotFoundError) as error:
+        print(f"Error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

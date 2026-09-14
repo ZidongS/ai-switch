@@ -6,6 +6,10 @@ When you use multiple coding agents and multiple model providers, changing provi
 
 Choose a provider profile once, then activate it with `ai-switch use NAME`. The built-in GLM and DeepSeek presets already contain the provider-specific files, endpoints, protocols, model catalogs, and Claude Code mappings recommended by their official documentation. You only need to enter your API key. Custom OpenAI-compatible providers are supported too.
 
+A profile can offer several models (for example GLM 5.3 and GLM 5.3 Flash, or DeepSeek V4 Pro, V4 Flash and V4 Flash Vision). `ai-switch use` asks which one to activate and writes the answer to both agents, so the model pickers *inside* Claude Code and Codex keep working instead of being pinned to a single model.
+
+Switching also leaves conversation history alone: sessions, rollouts, `history.jsonl` and the agents' runtime databases are never copied into a profile or overwritten by a switch, and `ai-switch doctor` reports the things that really do make old sessions disappear.
+
 This is a secure, headless-friendly command-line tool for servers without a desktop environment or administrator privileges.
 
 ## Install
@@ -60,6 +64,23 @@ Select `glm` or `deepseek`, enter the API key, and activate the generated config
 ai-switch use glm
 ```
 
+`use` lists the models the profile offers and remembers your choice:
+
+```text
+This profile provides 2 models:
+  1) glm-5.3         GLM-5.3 flagship (1M context)  [default]
+  2) glm-5.3-flash   GLM-5.3 flash (fast, 1M context)
+Select model [1-2, Enter=glm-5.3, q=cancel]:
+```
+
+For scripts and servers, choose without prompting (name, unique prefix, or index):
+
+```bash
+ai-switch use glm --model glm-5.3-flash
+ai-switch use glm -m 2 -y
+ai-switch use glm --dry-run          # show what would change
+```
+
 Edit `~/.codex/config.toml` and `~/.claude/settings.json` for another provider, then save that configuration as a second profile:
 
 ```bash
@@ -83,23 +104,79 @@ ai-switch describe default "Default daily configuration"
 
 `list` shows the active marker, profile name, configured clients, description, detected models, and endpoint hostnames. API keys are never printed.
 
+## Choosing a model
+
+Each profile keeps its model list in `models.json` next to the client files:
+
+```bash
+ai-switch models                 # list the models of the active profile
+ai-switch models glm --json      # machine readable
+ai-switch upgrade glm            # derive models.json for a profile from an older release
+```
+
+For every model a profile records the Codex catalogue entry and the Claude Code mapping, so activating one model updates all of these consistently:
+
+* Codex: the top-level `model` (and `model_reasoning_effort`), plus a `~/.codex/models.json` catalogue that lists **every** model of the profile, which is what makes Codex's own `/model` picker show them.
+* Claude Code: the default model in `settings.json` plus the Opus/Sonnet/Haiku mappings. The presets map the three categories to *different* provider models where they exist, and they never set `ANTHROPIC_MODEL`, because a pinned environment model overrides your selection and makes `/model` do nothing.
+
+The `glm` and `deepseek` presets ship multi-model lists. A custom (OpenAI-compatible) profile is open-ended: it does not publish a catalogue, and `ai-switch use NAME --model anything` accepts any model name the endpoint serves.
+
+## Session history
+
+Conversation history belongs to the agents, not to a provider, so ai-switch never manages it. These files are deliberately excluded from profiles and switches:
+
+```text
+~/.codex/history.jsonl, ~/.codex/session_index.jsonl, ~/.codex/sessions/,
+~/.codex/*_N.sqlite (runtime state, logs, goals, memories)
+~/.claude.json, ~/.claude/history.jsonl, ~/.claude/projects/, ~/.claude/sessions/
+```
+
+If sessions do seem to disappear after a switch, run:
+
+```bash
+ai-switch doctor          # full report; --json for tooling
+ai-switch doctor --fix    # quarantine damaged Codex runtime databases
+```
+
+`doctor` checks, among other things:
+
+* **Damaged SQLite runtime databases.** Codex keeps thread metadata in `~/.codex/state_*.sqlite` and `thread_history_1.sqlite`. When one is damaged (typical messages: `database disk image is malformed`, `file is not a database`) Codex silently stops listing recent sessions in `codex resume`. `doctor` detects this — reading a snapshot copy when the live file cannot be opened — and `--fix` moves the damaged files into `~/.config/ai-switch/quarantine/<timestamp>/`. Codex rebuilds the database from the rollout files on the next start, which brings resumable sessions back. Rollouts and history are not touched.
+* **Network filesystems.** If `CODEX_HOME` lives on NFS/CIFS/SMB, SQLite databases are corrupted sooner or later, which is the usual root cause of "history lost after switching". Keep the runtime databases on a local disk instead:
+
+  ```bash
+  export CODEX_SQLITE_HOME=/var/tmp/codex-sqlite-$USER   # a local, persistent directory
+  ```
+
+  `ai-switch add` offers to write `sqlite_home` into the generated Codex configuration when it detects a network filesystem.
+* **A stale model catalogue.** A catalogue left behind by the previous provider hides the new provider's models from Codex and makes sessions that used them unresumable. ai-switch removes that leftover file (only if it wrote it itself, and it backs it up first), and `doctor` verifies the configured model exists in the catalogue.
+* **Disabled history persistence** (`[history] persistence = "none"`), a Claude Code model pinned by `ANTHROPIC_MODEL`, and `claude`/`codex` processes that are running while you switch and will rewrite their configuration on exit.
+
+`codex resume` only lists sessions of the current directory by default; `codex resume --all` shows every directory. That cwd filter, not a lost session, is a common false alarm.
+
 ## Safety and storage
 
-Before activation, the current Codex and Claude files are backed up under `~/.config/ai-switch/backups/`. Profiles are stored under `~/.config/ai-switch/profiles/`; directories use mode 700 and files use mode 600. Restart `claude` or `codex` after switching so the process reloads its configuration.
+Before activation, the current Codex and Claude files are backed up under `~/.config/ai-switch/backups/<timestamp>/` (files that a switch removes are kept under `removed/`). Profiles are stored under `~/.config/ai-switch/profiles/`; directories use mode 700 and files use mode 600. The active profile and the last used model are recorded in `~/.config/ai-switch/state.json`. Restart `claude` or `codex` after switching so the process reloads its configuration.
 
-Set `AI_SWITCH_HOME` to use a different profile directory.
+Set `AI_SWITCH_HOME` to use a different profile directory, `CODEX_HOME`/`CLAUDE_CONFIG_DIR` for relocated agent configurations, and `AI_SWITCH_API_KEY` to fill the API key prompt non-interactively.
 
 ## Commands
 
 ```text
 ai-switch init NAME [-d DESCRIPTION]  Save current files as a new profile
-ai-switch list                         List profiles and configuration summaries
-ai-switch use NAME                    Back up and activate a profile
+ai-switch list                        List profiles and configuration summaries
+ai-switch use NAME [-m MODEL] [-y] [-n]  Back up and activate a profile (and a model)
+ai-switch models [NAME] [--json]      Show the models a profile offers
 ai-switch current                     Print the active profile
 ai-switch describe NAME TEXT          Set a profile description
-ai-switch add                          Create a profile interactively (GLM, DeepSeek, or custom)
+ai-switch upgrade NAME                Derive models.json for a profile from an older release
+ai-switch add                         Create a profile interactively (GLM, DeepSeek, or custom)
+ai-switch doctor [--fix] [--json]     Check configuration and session-history health
 ai-switch --help                      Show full usage and examples
 ```
+
+## Upgrading from 0.1
+
+Existing profiles keep working. Profiles that only have `codex-models.json` are read as before and get a model picker automatically; run `ai-switch upgrade NAME` (or re-create the profile with `ai-switch add`) to materialise an editable `models.json` with explicit per-model Claude Code mappings.
 
 ## Development
 
