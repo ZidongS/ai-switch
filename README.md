@@ -6,7 +6,7 @@ When you use multiple coding agents and multiple model providers, changing provi
 
 Choose a provider profile once, then activate it with `ai-switch use NAME`. The built-in GLM and DeepSeek presets already contain the provider-specific files, endpoints, protocols, model catalogs, and Claude Code mappings recommended by their official documentation. You only need to enter your API key. Custom OpenAI-compatible providers are supported too.
 
-A profile can offer several models (for example GLM 5.3 and GLM 5.3 Flash, or DeepSeek V4 Pro, V4 Flash and V4 Flash Vision). `ai-switch use` asks which one to activate and writes the answer to both agents, so the model pickers *inside* Claude Code and Codex keep working instead of being pinned to a single model.
+A profile can offer several models (for example GLM 5.3 and GLM 5.3 Flash, or DeepSeek Flash and DeepSeek V4 Pro). `ai-switch use` asks which one to activate and writes the answer to both agents, so the model pickers *inside* Claude Code and Codex keep working instead of being pinned to a single model.
 
 Switching also leaves conversation history alone: sessions, rollouts, `history.jsonl` and the agents' runtime databases are never copied into a profile or overwritten by a switch, and `ai-switch doctor` reports the things that really do make old sessions disappear.
 
@@ -90,7 +90,7 @@ ai-switch use glm
 ai-switch current
 ```
 
-Create a profile through an interactive prompt (no editor required; API keys are hidden while typing). Choose the built-in `glm` preset to generate the complete ZAI Codex Responses configuration, Codex model catalog, and Claude Code model/environment mappings automatically. The `deepseek` preset creates the three DeepSeek model entries, including image input metadata for `deepseek-v4-flash-vision-exp`, plus the recommended Claude Code mappings:
+Create a profile through an interactive prompt (no editor required; API keys are hidden while typing). Choose the built-in `glm` preset to generate the complete ZAI Codex Responses configuration, Codex model catalog, and Claude Code model/environment mappings automatically. The `deepseek` preset creates the two model entries the DeepSeek endpoint currently accepts (`deepseek-flash` and `deepseek-v4-pro`, both with image input metadata) plus the recommended Claude Code mappings:
 
 ```bash
 ai-switch add
@@ -120,6 +120,20 @@ For every model a profile records the Codex catalogue entry and the Claude Code 
 * Claude Code: the default model in `settings.json` plus the Opus/Sonnet/Haiku mappings. The presets map the three categories to *different* provider models where they exist, and they never set `ANTHROPIC_MODEL`, because a pinned environment model overrides your selection and makes `/model` do nothing.
 
 The `glm` and `deepseek` presets ship multi-model lists. A custom (OpenAI-compatible) profile is open-ended: it does not publish a catalogue, and `ai-switch use NAME --model anything` accepts any model name the endpoint serves.
+
+### When a provider adds or renames a model
+
+Model names change, and an endpoint refuses a name it does not know. Ask the provider what your key may use:
+
+```bash
+curl -s https://api.deepseek.com/models -H "Authorization: Bearer $KEY"
+```
+
+(A rejected name is also reported in the API error itself: *"The supported API model names are ..."*.) Historically DeepSeek answered to `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp`; today those are aliases that the endpoint resolves to `deepseek-flash`. To add a model, append it to the profile's `models.json` — the `claude` mapping decides what Opus/Sonnet/Haiku resolve to, the `codex` entry controls whether Codex's own picker offers it. Keep the entries of names that older sessions were recorded with in the Codex catalogue so those sessions stay resumable, then activate:
+
+```bash
+ai-switch use deepseek -m deepseek-flash
+```
 
 ## Session history
 

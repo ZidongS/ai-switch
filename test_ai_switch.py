@@ -129,7 +129,12 @@ class ClaudeMergeTest(unittest.TestCase):
 class PresetTest(unittest.TestCase):
     def test_presets_offer_several_models(self):
         self.assertGreaterEqual(len(ai_switch.PRESETS["glm"]["models"]), 2)
-        self.assertGreaterEqual(len(ai_switch.PRESETS["deepseek"]["models"]), 3)
+        self.assertGreaterEqual(len(ai_switch.PRESETS["deepseek"]["models"]), 2)
+
+    def test_deepseek_preset_uses_current_api_model_names(self):
+        slugs = [m["slug"] for m in ai_switch.PRESETS["deepseek"]["models"]]
+        self.assertEqual(slugs, ["deepseek-flash", "deepseek-v4-pro"])
+        self.assertEqual(ai_switch.PRESETS["deepseek"]["default"], "deepseek-flash")
 
     def test_presets_map_claude_categories_distinctly(self):
         for name, preset in ai_switch.PRESETS.items():

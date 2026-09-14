@@ -23,7 +23,7 @@ Conversation history is never part of a profile
 import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 def _env_path(name, default):
@@ -332,19 +332,14 @@ GLM_MODELS = [
                               haiku="glm-5.3-flash[1m]")},
 ]
 DEEPSEEK_MODELS = [
-    {"slug": "deepseek-v4-pro", "label": "DeepSeek V4 Pro (deep reasoning)", "reasoning": "max",
-     "codex": codex_entry("deepseek-v4-pro", "Deep reasoning DeepSeek model", ("text",), 1, 1048576, "high"),
+    {"slug": "deepseek-flash", "label": "DeepSeek Flash (fast, current generation, text+image)", "reasoning": "high",
+     "codex": codex_entry("deepseek-flash", "Fast general-purpose DeepSeek model", ("text", "image"), 0, 1048576, "high"),
+     "claude": claude_mapping("deepseek-flash[1m]", opus="deepseek-flash[1m]", sonnet="deepseek-flash[1m]",
+                              haiku="deepseek-flash", subagent="deepseek-flash")},
+    {"slug": "deepseek-v4-pro", "label": "DeepSeek V4 Pro (deep reasoning, text+image)", "reasoning": "max",
+     "codex": codex_entry("deepseek-v4-pro", "Deep reasoning DeepSeek model", ("text", "image"), 1, 1048576, "high"),
      "claude": claude_mapping("deepseek-v4-pro[1m]", opus="deepseek-v4-pro[1m]", sonnet="deepseek-v4-pro[1m]",
-                              haiku="deepseek-v4-flash", subagent="deepseek-v4-flash")},
-    {"slug": "deepseek-v4-flash", "label": "DeepSeek V4 Flash (fast, general purpose)", "reasoning": "high",
-     "codex": codex_entry("deepseek-v4-flash", "Fast general-purpose DeepSeek model", ("text",), 0, 1048576, "high"),
-     "claude": claude_mapping("deepseek-v4-flash[1m]", opus="deepseek-v4-flash[1m]",
-                              sonnet="deepseek-v4-flash[1m]", haiku="deepseek-v4-flash",
-                              subagent="deepseek-v4-flash")},
-    {"slug": "deepseek-v4-flash-vision-exp", "label": "DeepSeek V4 Flash Vision (image input)", "reasoning": "high",
-     "codex": codex_entry("deepseek-v4-flash-vision-exp", "DeepSeek vision model", ("text", "image"), 2, 1048576, "high"),
-     "claude": claude_mapping("deepseek-v4-flash-vision-exp", opus="deepseek-v4-flash-vision-exp",
-                              sonnet="deepseek-v4-flash-vision-exp", haiku="deepseek-v4-flash-vision-exp")},
+                              haiku="deepseek-flash", subagent="deepseek-flash")},
 ]
 
 PRESETS = {
@@ -360,7 +355,7 @@ PRESETS = {
     "deepseek": {"endpoint": DEEPSEEK_ENDPOINT, "claude_endpoint": DEEPSEEK_CLAUDE_ENDPOINT,
                  "common_env": {"CLAUDE_CODE_EFFORT_LEVEL": "max", "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "786432",
                                 "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"},
-                 "models": DEEPSEEK_MODELS, "default": "deepseek-v4-flash",
+                 "models": DEEPSEEK_MODELS, "default": "deepseek-flash",
                  "codex_template": ('model = "@MODEL@"\nmodel_provider = "deepseek"\npreferred_auth_method = "apikey"\n'
                                     'forced_login_method = "api"\nmodel_reasoning_effort = "@EFFORT@"\n'
                                     'model_catalog_json = "@CATALOG@"\n\n[model_providers.deepseek]\nname = "deepseek"\n'
