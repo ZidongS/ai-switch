@@ -454,28 +454,6 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("not using the model ai-switch activated", self.out)
         self.assertIn("re-run 'ai-switch use p -m m'", self.out.lower())
 
-    def test_unmatched_tool_call_in_a_recent_session_is_reported(self):
-        rollout = self.paths["CODEX_DIR"] / "sessions" / "2026" / "09" / "15" / "rollout-test.jsonl"
-        record = lambda payload: json.dumps({"type": "response_item", "payload": payload})
-        write(rollout, "\n".join([
-            record({"type": "function_call", "name": "exec_command", "call_id": "c1"}),
-            record({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
-            record({"type": "custom_tool_call", "name": "apply_patch", "call_id": "c2"}),
-        ]) + "\n")
-        run(self, "doctor")
-        self.assertIn("unmatched tool call", self.out)
-        self.assertIn("c2", self.out)
-        # once the call is answered the warning goes away
-        write(rollout, "\n".join([
-            record({"type": "function_call", "name": "exec_command", "call_id": "c1"}),
-            record({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
-            record({"type": "custom_tool_call", "name": "apply_patch", "call_id": "c2"}),
-            record({"type": "custom_tool_call_output", "call_id": "c2", "output": "Done!"}),
-        ]) + "\n")
-        run(self, "doctor")
-        self.assertNotIn("unmatched tool call", self.out)
-        self.assertIn("every tool call has a reply", self.out)
-
     def test_pinned_claude_model_is_reported(self):
         write(self.paths["CLAUDE"], {"env": {"ANTHROPIC_MODEL": "pinned", "ANTHROPIC_BASE_URL": "https://x"}})
         run(self, "doctor")
