@@ -20,10 +20,13 @@ Conversation history is never part of a profile
     switch (corrupt runtime SQLite databases, SQLite stored on NFS, disabled
     history persistence, claude/codex running while switching).
 """
-import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
+import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, textwrap, time
 from pathlib import Path
 
-VERSION = "0.3.2"
+VERSION = "0.4.0"
+
+# set by --no-color; Style() consults it so every command honours one switch
+COLOR_DISABLED = False
 
 
 def _env_path(name, default):
@@ -126,6 +129,93 @@ def timestamp():
 def blank_profile_dir(path):
     path.mkdir(parents=True, exist_ok=True)
     secure(path)
+
+
+# ---------------------------------------------------------------- presentation
+class Style:
+    """ANSI helpers that degrade to plain text (pipes, NO_COLOR=1, dumb terminals)."""
+
+    CODES = {"bold": "1", "dim": "2", "red": "31", "green": "32", "yellow": "33", "blue": "34",
+             "magenta": "35", "cyan": "36", "grey": "90"}
+
+    def __init__(self, stream=None, force_off=False):
+        stream = sys.stdout if stream is None else stream
+        self.terminal = bool(getattr(stream, "isatty", lambda: False)())
+        self.on = (self.terminal and not (force_off or COLOR_DISABLED)
+                   and not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb")
+
+    def __call__(self, text, *names):
+        if not self.on or not names:
+            return str(text)
+        codes = ";".join(self.CODES[name] for name in names if name in self.CODES)
+        return f"\x1b[{codes}m{text}\x1b[0m" if codes else str(text)
+
+    def rule(self, width=68):
+        return self("─" * width, "grey")
+
+
+SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+BAR_WIDTH = 16
+
+
+class Progress:
+    """Staged progress: spinner while each action runs, a bar, and a closing card.
+
+    Animation is used on a terminal only; everywhere else the caller keeps the
+    plain one-line-per-action output, so scripts and tests stay unaffected.
+    """
+
+    def __init__(self, total, style, stream=None, animate=True):
+        self.style = style
+        self.stream = stream or sys.stdout
+        self.total = max(int(total), 1)
+        self.done = 0
+        # NO_COLOR mutes the colours, not the animation: a terminal still gets the
+        # spinner and the bar (plain text when colour is off), everything else
+        # keeps the one-line-per-action output.
+        self.enabled = bool(style.terminal and animate
+                            and not COLOR_DISABLED and os.environ.get("TERM", "") != "dumb")
+        self.started = time.time()
+
+    def _bar(self):
+        filled = max(0, min(BAR_WIDTH, round(BAR_WIDTH * self.done / self.total)))
+        return self.style("█" * filled, "green") + self.style("░" * (BAR_WIDTH - filled), "grey")
+
+    def animate(self, text, frames=6, delay=0.03):
+        if not self.enabled:
+            return
+        for index in range(frames):
+            self.stream.write(f"\r\x1b[K  {self.style(SPINNER[index % len(SPINNER)], 'cyan')} "
+                              f"{text}  {self._bar()}")
+            self.stream.flush()
+            time.sleep(delay)
+
+    def step(self, text, detail=""):
+        if not self.enabled:
+            self.stream.write(text + (f": {detail}" if detail else "") + "\n")
+            self.stream.flush()
+            self.done += 1
+            return
+        self.done += 1
+        tail = f"  {self.style(detail, 'grey')}" if detail else ""
+        self.stream.write(f"\r\x1b[K  {self.style('✓', 'green')} {text}{tail}  {self._bar()}\n")
+        self.stream.flush()
+
+    def result(self, title, rows):
+        elapsed = time.time() - self.started
+        if not self.enabled:
+            print(title)
+            for label, value in rows:
+                print(f"{label}: {value}" if label else value)
+            return
+        self.stream.write("\n" + self.style.rule() + "\n")
+        self.stream.write(f"  {self.style(title, 'bold', 'green')}   "
+                          f"{self.style(f'({elapsed:.2f}s)', 'grey')}\n")
+        for label, value in rows:
+            prefix = f"  {self.style(label, 'grey')}" if label else "  "
+            self.stream.write(f"{prefix}  {value}\n")
+        self.stream.write(self.style.rule() + "\n")
+        self.stream.flush()
 
 
 # ---------------------------------------------------------------- profile layout
@@ -639,7 +729,35 @@ def keep_copy(backup, path):
     secure(backup / path.name)
 
 
-def apply_changes(changes, name, slug, dry_run=False):
+def write_detail(path, data):
+    """Short description of what a written file now contains."""
+    name = path.name
+    if name == "models.json":
+        try:
+            models = json.loads(data).get("models") or []
+            return f"{len(models)} model(s)"
+        except ValueError:
+            return ""
+    if name == "config.toml":
+        model = top_level_get(data, "model")
+        effort = top_level_get(data, "model_reasoning_effort")
+        return " · ".join(part for part in (f"model {model}" if model else "",
+                                            f"effort {effort}" if effort else "") if part)
+    if name == "settings.json":
+        try:
+            settings = json.loads(data)
+        except ValueError:
+            return ""
+        pins = claude_model_pins(settings)
+        distinct = sorted(set(pins.values()))
+        return f"opus/sonnet/haiku → {distinct[0]}" if len(distinct) == 1 else \
+            f"{len(distinct)} Claude category mappings"
+    if name == "auth.json":
+        return "API key stored"
+    return ""
+
+
+def apply_changes(changes, name, slug, dry_run=False, progress=None):
     backup = backup_dir()
     written, backed_up = {}, 0
     for path in sorted(changes, key=str):
@@ -652,20 +770,30 @@ def apply_changes(changes, name, slug, dry_run=False):
             raise ValueError(f"refusing to manage agent history file: {path}")
         if data is None:
             if path.exists():
+                if progress:
+                    progress.animate(f"removing {display_path(path)}")
                 removed = backup / "removed"
                 removed.mkdir(parents=True, exist_ok=True)
                 secure(removed)
                 shutil.move(str(path), str(removed / path.name))
                 backed_up += 1
                 written[str(path)] = "removed"
-            print(f"Removed {display_path(path)}")
+            if progress:
+                progress.step(f"remove {display_path(path)}", "backed up first")
+            else:
+                print(f"Removed {display_path(path)}")
             continue
+        if progress:
+            progress.animate(f"writing {display_path(path)}")
         if path.exists():
             keep_copy(backup, path)
             backed_up += 1
         write_atomic(path, data)
         written[str(path)] = digest(data)
-        print(f"Wrote {display_path(path)}")
+        if progress:
+            progress.step(f"write {display_path(path)}", write_detail(path, data))
+        else:
+            print(f"Wrote {display_path(path)}")
     if not dry_run:
         state = load_state()
         models = state.get("models") if isinstance(state.get("models"), dict) else {}
@@ -719,20 +847,39 @@ def cmd_use(args):
     changes, notes = compute_changes(d, slug, pin=args.pin)
     for note in notes:
         print(f"Note: {note}", file=sys.stderr)
-    backup = apply_changes(changes, name, slug, dry_run=args.dry_run)
+    plain = getattr(args, "plain", False)
+    style = Style(force_off=plain)
+    progress = Progress(len(changes) + 1, style, animate=not plain)
+    if not args.dry_run and progress.enabled:
+        progress.animate(f"activating {name}")
+    if not progress.enabled:
+        progress = None          # keep the plain, script-friendly output off a terminal
+    backup = apply_changes(changes, name, slug, dry_run=args.dry_run, progress=progress)
     if not args.dry_run:
-        print(f"Active profile: {name}" + (f"\nDefault model: {slug} (new sessions)" if slug else ""))
-        if args.pin and slug:
-            print(f"Pinned: only '{slug}' is published, so Codex cannot switch to another model.")
-        elif catalog:
-            print(f"Published models: {len(catalog['models'])} - switch any time with /model inside "
-                  "codex (Claude Code uses its Opus/Sonnet/Haiku mappings), or change the default "
-                  "with -m/--model.")
-        print(f"Backup: {backup}" if backup else "Backup: nothing to back up (no files existed yet)")
-        print("Restart claude/codex so they reload their configuration.")
+        backup_text = display_path(backup) if backup else "nothing to back up (no files existed yet)"
+        if progress:
+            rows = [("profile", f"{style(name, 'bold', 'cyan')}"
+                               + (style("   only this model is published", "grey") if args.pin and slug else "")),
+                    ("default", f"{style(str(slug), 'green')}   {style('new sessions', 'grey')}" if slug else "-"),
+                    ("models ",
+                     f"{len(catalog['models'])} published   {style('pick one inside codex with /model', 'grey')}"
+                     if catalog else "no model list"),
+                    ("backup ", style(backup_text, "grey")),
+                    ("next   ", "restart claude/codex so they reload their configuration")]
+            progress.result(f"{name} is active", rows)
+        else:
+            print(f"Active profile: {name}" + (f"\nDefault model: {slug} (new sessions)" if slug else ""))
+            if args.pin and slug:
+                print(f"Pinned: only '{slug}' is published, so Codex cannot switch to another model.")
+            elif catalog:
+                print(f"Published models: {len(catalog['models'])} - switch any time with /model inside "
+                      "codex (Claude Code uses its Opus/Sonnet/Haiku mappings), or change the default "
+                      "with -m/--model.")
+            print(f"Backup: {backup}" if backup else "Backup: nothing to back up (no files existed yet)")
+            print("Restart claude/codex so they reload their configuration.")
         if not args.no_check:
             for warning in codex_health_warnings((d / "codex-config.toml").exists()):
-                print(f"Warning: {warning}", file=sys.stderr)
+                print(style("Warning: ", "yellow") + warning, file=sys.stderr)
     return 0
 
 
@@ -805,6 +952,12 @@ def summary(d):
             "; ".join(details) or "No automatic summary")
 
 
+def _profile_host(d, settings):
+    text = read_text(d / "codex-config.toml") or ""
+    base = _provider_base_url(text) or (settings.get("env") or {}).get("ANTHROPIC_BASE_URL")
+    return host_of(base) if base else ""
+
+
 def _provider_base_url(text):
     _, tail = split_toml(text)
     found = re.search(r'(?m)^base_url[ \t]*=[ \t]*["\']([^"\']+)', tail)
@@ -860,8 +1013,72 @@ def cmd_models(args):
     return 0
 
 
-def cmd_current(_):
-    print(active_profile() or "(none)")
+def cmd_current(args):
+    """Show every configured profile, its models, and the live state."""
+    name = active_profile()
+    if getattr(args, "plain", False):
+        print(name or "(none)")
+        return 0
+    style = Style()
+    profiles = [p for p in sorted(PROFILES.iterdir()) if p.is_dir()] if PROFILES.exists() else []
+    if not profiles:
+        print(style("no profiles yet", "yellow") + style("  ·  create one with 'ai-switch add'", "grey"))
+        return 0
+    published = len(parse_json_file(CODEX_MODELS).get("models") or [])
+    live_model = top_level_get(read_text(CODEX) or "", "model")
+    print(style("ai-switch", "bold") + style(f"  ·  {len(profiles)} profile(s)  ·  "
+                                             f"{display_path(ROOT)}", "grey"))
+    print(style.rule())
+    for d in profiles:
+        active = d.name == name
+        marker = style("●", "green") if active else style("○", "grey")
+        head = style(d.name, "bold", "cyan") if active else style(d.name, "bold")
+        description = profile_meta(d).get("description") or ""
+        tail = style("active", "green") if active else ""
+        print(f"  {marker} {head}   {style(description, 'grey')}   {tail}".rstrip())
+        settings = parse_json_file(d / "claude-settings.json")
+        catalog = load_catalog(d, settings)
+        codex_model = top_level_get(read_text(d / "codex-config.toml") or "", "model")
+        claude_model = settings.get("model")
+        host = _profile_host(d, settings)
+        rows = []
+        if codex_model:
+            published_for_this = f"{len(catalog['models'])} models" if catalog else "no model list"
+            rows.append(("Codex ", f"{style(str(codex_model), 'green')}  {style('· ' + published_for_this, 'grey')}"))
+        if claude_model:
+            pins = claude_model_pins(settings)
+            distinct = sorted(set(pins.values()))
+            if len(distinct) == 1:
+                mapping = f"opus/sonnet/haiku → {distinct[0]}"
+            elif distinct:
+                mapping = f"{len(distinct)} Claude category mappings"
+            else:
+                mapping = ""
+            rows.append(("Claude", f"{style(str(claude_model), 'green')}"
+                                   + (style('  · ' + mapping, 'grey') if mapping else "")))
+        if host:
+            rows.append(("host  ", style(host, "grey")))
+        if catalog:
+            slugs = [entry["slug"] + (" ★" if entry["slug"] == catalog["default"] else "")
+                     for entry in catalog["models"]]
+            first = True
+            for line in textwrap.wrap(", ".join(slugs), width=76) or [""]:
+                rows.append(("models" if first else "      ", style(line, "grey")))
+                first = False
+        for label, value in rows:
+            print(f"      {style(label, 'grey')}  {value}")
+        if active:
+            live = []
+            if live_model and live_model != codex_model:
+                live.append(style(f"live Codex model is {live_model} (a running codex session changed it)",
+                                  "yellow"))
+            elif live_model:
+                live.append(style(f"live Codex config uses {live_model}", "grey"))
+            if published and catalog and published != len(catalog["models"]):
+                live.append(style(f"{published} model(s) published to {display_path(CODEX_MODELS)}", "grey"))
+            for line in live:
+                print(f"      {style('state ', 'grey')}  {line}")
+        print()
     return 0
 
 
@@ -1384,6 +1601,7 @@ files inside a profile are switched. Restart claude/codex after switching."""
     parser = argparse.ArgumentParser(prog="ai-switch", description=description, epilog=epilog,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--version", action="version", version=f"ai-switch {VERSION}")
+    parser.add_argument("--no-color", action="store_true", help="disable colours and animation everywhere")
     sub = parser.add_subparsers(dest="cmd")
 
     p = sub.add_parser("init", help="save the current Codex/Claude config as a new profile")
@@ -1402,6 +1620,7 @@ files inside a profile are switched. Restart claude/codex after switching."""
                    help="ask which model the new sessions should start with (the others stay selectable in /model)")
     p.add_argument("--pin", action="store_true",
                    help="publish only this model, so Codex's own picker cannot switch to another one")
+    p.add_argument("--plain", action="store_true", help="no progress animation or colours")
     p.add_argument("-y", "--yes", action="store_true", help="accepted for compatibility; use never prompts by default")
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
     p.add_argument("--no-check", action="store_true", help="skip the session-history health check")
@@ -1412,7 +1631,8 @@ files inside a profile are switched. Restart claude/codex after switching."""
     p.add_argument("--json", action="store_true")
     p.set_defaults(fn=cmd_models)
 
-    p = sub.add_parser("current", help="show the active profile")
+    p = sub.add_parser("current", help="show every profile, its models and the live state")
+    p.add_argument("-p", "--plain", action="store_true", help="print only the active profile name")
     p.set_defaults(fn=cmd_current)
 
     p = sub.add_parser("describe", help="set a profile description")
@@ -1434,6 +1654,8 @@ files inside a profile are switched. Restart claude/codex after switching."""
     p.set_defaults(fn=cmd_doctor)
 
     args = parser.parse_args(argv)
+    global COLOR_DISABLED
+    COLOR_DISABLED = bool(getattr(args, "no_color", False))
     if not args.cmd:
         parser.print_help()
         print("\nAvailable profiles:")

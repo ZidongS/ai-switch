@@ -70,11 +70,22 @@ default for new sessions is the one you last used, or the profile default. Add `
 asked, or `-m/--model` to set the default directly.
 
 ```text
-Active profile: glm
-Default model: glm-5.3 (new sessions)
-Published models: 3 - switch any time with /model inside codex (Claude Code uses its
-Opus/Sonnet/Haiku mappings), or change the default with -m/--model.
+  ⠹ writing ~/.codex/models.json  ████████░░░░░░░░
+  ✓ write ~/.claude/settings.json  opus/sonnet/haiku → glm-5.3[1m]   ████░░░░░░░░░░░░
+  ✓ write ~/.codex/config.toml     model glm-5.3 · effort max        ████████░░░░░░░░
+  ✓ write ~/.codex/models.json     3 model(s)                        ████████████░░░░
+────────────────────────────────────────────────────────────────────
+  glm is active   (0.73s)
+  profile  glm
+  default  glm-5.3   new sessions
+  models   3 published   pick one inside codex with /model
+  backup   ~/.config/ai-switch/backups/20260915-203657
+  next     restart claude/codex so they reload their configuration
+────────────────────────────────────────────────────────────────────
 ```
+
+The progress animation needs a terminal — piped output, `TERM=dumb`, `--plain` and `--no-color` keep the
+plain one-line-per-action form (handy for scripts). `NO_COLOR=1` mutes the colours but keeps the spinner.
 
 With `--choose` you get the picker instead:
 
@@ -118,7 +129,25 @@ Update an existing profile description:
 ai-switch describe default "Default daily configuration"
 ```
 
-`list` shows the active marker, profile name, configured clients, description, detected models, and endpoint hostnames. API keys are never printed.
+`list` shows the active marker, profile name, configured clients, description, detected models, and endpoint hostnames. `current` prints a panel of **every** profile with its models, the default one (★), the endpoint and — for the active profile — whether the live agent configuration still matches:
+
+```text
+ai-switch  ·  4 profile(s)  ·  ~/.config/ai-switch
+────────────────────────────────────────────────────────────────────
+  ○ glm   glm-coding-plan
+      Codex   glm-5.3  · 3 models
+      Claude  glm-5.3  · 2 Claude category mappings
+      host    open.bigmodel.cn
+      models  glm-5.3 ★, glm-5.3-flash, glm-5-turbo
+
+  ● paratera   custom paratera   active
+      Codex   DeepSeek-V4.1-Flash  · 31 models
+      Claude  DeepSeek-V4.1-Flash  · opus/sonnet/haiku → DeepSeek-V4.1-Flash
+      host    llmapi.paratera.com
+      models  DeepSeek-V4.1-Flash ★, DeepSeek-V4-Pro, …, MiniMax-Text-01
+```
+
+Use `current --plain` to print just the active profile name. API keys are never printed.
 
 ## Choosing a model
 
@@ -199,9 +228,10 @@ Set `AI_SWITCH_HOME` to use a different profile directory, `CODEX_HOME`/`CLAUDE_
 ```text
 ai-switch init NAME [-d DESCRIPTION]  Save current files as a new profile
 ai-switch list                        List profiles and configuration summaries
-ai-switch use NAME [-m MODEL] [-y] [-n]  Back up and activate a profile (and a model)
+ai-switch use NAME [-m MODEL] [--choose] [--pin] [--plain]
+                                      Back up and activate a profile (animated, -m sets the default)
 ai-switch models [NAME] [--json]      Show the models a profile offers
-ai-switch current                     Print the active profile
+ai-switch current [-p]                Show every profile, its models and the live state (-p: name only)
 ai-switch describe NAME TEXT          Set a profile description
 ai-switch upgrade NAME                Derive models.json for a profile from an older release
 ai-switch add                         Create a profile interactively (GLM, DeepSeek, or custom)

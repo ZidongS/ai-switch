@@ -460,6 +460,81 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("pinned", self.out)
 
 
+class PresentationTest(unittest.TestCase):
+    def setUp(self):
+        self.paths = sandbox(self)
+
+    def _tty_style(self):
+        class Tty(io.StringIO):
+            def isatty(self):
+                return True
+        stream = Tty()
+        import os as _os
+        saved = _os.environ.get("NO_COLOR"), _os.environ.get("TERM")
+        _os.environ["NO_COLOR"] = ""
+        _os.environ["TERM"] = "xterm-256color"
+        self.addCleanup(lambda: (_os.environ.__setitem__("NO_COLOR", saved[0]) if saved[0] is not None
+                                 else _os.environ.pop("NO_COLOR", None),
+                                 _os.environ.__setitem__("TERM", saved[1]) if saved[1] is not None
+                                 else _os.environ.pop("TERM", None)))
+        return ai_switch.Style(stream=stream), stream
+
+    def test_progress_falls_back_to_plain_lines_without_a_terminal(self):
+        stream = io.StringIO()
+        style = ai_switch.Style(stream=stream)               # not a tty
+        progress = ai_switch.Progress(2, style, stream=stream)
+        self.assertFalse(progress.enabled)
+        progress.step("write ~/.codex/models.json", "31 model(s)")
+        self.assertIn("write ~/.codex/models.json: 31 model(s)", stream.getvalue())
+        self.assertNotIn("█", stream.getvalue())
+
+    def test_progress_draws_spinner_bar_and_result_card_on_a_terminal(self):
+        style, stream = self._tty_style()
+        progress = ai_switch.Progress(2, style, stream=stream)
+        self.assertTrue(progress.enabled)
+        progress.animate("activating p", frames=2, delay=0)
+        progress.step("write ~/.codex/config.toml", "model m-one")
+        progress.result("p is active", [("profile", "p"), ("models ", "2 published")])
+        text = stream.getvalue()
+        self.assertIn("activating p", text)
+        self.assertIn("✓", text)
+        self.assertIn("█", text)
+        self.assertIn("p is active", text)
+        self.assertIn("2 published", text)
+
+    def test_current_lists_every_profile_and_its_models(self):
+        write(self.paths["PROFILES"] / "alpha" / "codex-config.toml", CODEX_CONFIG)
+        write(self.paths["PROFILES"] / "alpha" / "models.json", MODELS)
+        write(self.paths["PROFILES"] / "alpha" / "claude-settings.json",
+              {"env": {"ANTHROPIC_BASE_URL": "https://alpha.example"}, "model": "m-one"})
+        write(self.paths["PROFILES"] / "beta" / "codex-config.toml", 'model = "beta-model"\nmodel_provider = "p"\n')
+        write(self.paths["CURRENT"], "alpha\n")
+        self.assertEqual(run(self, "current"), 0)
+        self.assertIn("2 profile(s)", self.out)
+        self.assertIn("alpha", self.out)
+        self.assertIn("active", self.out)
+        self.assertIn("beta", self.out)
+        self.assertIn("m-one", self.out)          # the models of the active profile are listed
+        self.assertIn("m-two", self.out)
+        self.assertIn("old.example", self.out)   # the host comes from the profile's Codex provider
+        self.assertIn("beta-model", self.out)
+
+    def test_current_plain_prints_only_the_active_name(self):
+        write(self.paths["PROFILES"] / "alpha" / "codex-config.toml", CODEX_CONFIG)
+        write(self.paths["CURRENT"], "alpha\n")
+        self.assertEqual(run(self, "current", "--plain"), 0)
+        self.assertEqual(self.out.strip(), "alpha")
+
+    def test_use_plain_skips_the_animation_and_keeps_the_facts(self):
+        write(self.paths["PROFILES"] / "p" / "codex-config.toml", CODEX_CONFIG)
+        write(self.paths["PROFILES"] / "p" / "models.json", MODELS)
+        write(self.paths["CODEX"], CODEX_CONFIG)
+        self.assertEqual(run(self, "use", "p", "--plain", "--no-check"), 0)
+        self.assertIn("Wrote ~/.codex/models.json", self.out)
+        self.assertIn("Active profile: p", self.out)
+        self.assertNotIn("█", self.out)
+
+
 class CatalogTest(unittest.TestCase):
     def test_build_codex_catalog_keeps_hand_written_entries(self):
         with tempfile.TemporaryDirectory() as tmp:
