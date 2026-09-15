@@ -131,6 +131,17 @@ class PresetTest(unittest.TestCase):
         self.assertGreaterEqual(len(ai_switch.PRESETS["glm"]["models"]), 2)
         self.assertGreaterEqual(len(ai_switch.PRESETS["deepseek"]["models"]), 2)
 
+    def test_glm_preset_uses_names_the_zai_endpoint_accepts(self):
+        slugs = [m["slug"] for m in ai_switch.PRESETS["glm"]["models"]]
+        self.assertEqual(slugs, ["glm-5.3", "glm-5.3-flash", "glm-5-turbo"])
+        for entry in ai_switch.PRESETS["glm"]["models"]:
+            self.assertEqual(entry["claude"]["model"], entry["slug"])
+            for value in entry["claude"]["env"].values():
+                self.assertNotIn("[1m]", str(value), entry["slug"])
+        turbo = ai_switch.PRESETS["glm"]["models"][2]
+        self.assertEqual(turbo["claude"]["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"], "190000")
+        self.assertEqual(turbo["codex"]["context_window"], 204800)
+
     def test_deepseek_preset_uses_current_api_model_names(self):
         slugs = [m["slug"] for m in ai_switch.PRESETS["deepseek"]["models"]]
         self.assertEqual(slugs, ["deepseek-flash", "deepseek-v4-pro"])

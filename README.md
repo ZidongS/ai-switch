@@ -90,7 +90,7 @@ ai-switch use glm
 ai-switch current
 ```
 
-Create a profile through an interactive prompt (no editor required; API keys are hidden while typing). Choose the built-in `glm` preset to generate the complete ZAI Codex Responses configuration, Codex model catalog, and Claude Code model/environment mappings automatically. The `deepseek` preset creates the two model entries the DeepSeek endpoint currently accepts (`deepseek-flash` and `deepseek-v4-pro`, both with image input metadata) plus the recommended Claude Code mappings:
+Create a profile through an interactive prompt (no editor required; API keys are hidden while typing). Choose the built-in `glm` preset to generate the complete ZAI Codex Responses configuration, Codex model catalog and Claude Code model/environment mappings for the three models the endpoint publishes (`glm-5.3`, `glm-5.3-flash`, `glm-5-turbo`) automatically. The `deepseek` preset creates the two model entries the DeepSeek endpoint currently accepts (`deepseek-flash` and `deepseek-v4-pro`, both with image input metadata) plus the recommended Claude Code mappings:
 
 ```bash
 ai-switch add
@@ -126,14 +126,19 @@ The `glm` and `deepseek` presets ship multi-model lists. A custom (OpenAI-compat
 Model names change, and an endpoint refuses a name it does not know. Ask the provider what your key may use:
 
 ```bash
-curl -s https://api.deepseek.com/models -H "Authorization: Bearer $KEY"
+curl -s https://api.deepseek.com/models      -H "Authorization: Bearer $KEY"   # OpenAI-style list
+curl -s https://open.bigmodel.cn/api/v1/models -H "Authorization: Bearer $KEY"  # Codex-format catalogue
 ```
 
-(A rejected name is also reported in the API error itself: *"The supported API model names are ..."*.) Historically DeepSeek answered to `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp`; today those are aliases that the endpoint resolves to `deepseek-flash`. To add a model, append it to the profile's `models.json` — the `claude` mapping decides what Opus/Sonnet/Haiku resolve to, the `codex` entry controls whether Codex's own picker offers it. Keep the entries of names that older sessions were recorded with in the Codex catalogue so those sessions stay resumable, then activate:
+A rejected name is also reported in the API error itself (*"The supported API model names are ..."*, or `模型不存在，请检查模型代码。`). Some providers publish their Codex catalogue directly (`/api/v1/models` on ZAI returns exactly the entries a profile's `codex-models.json` wants), so it can be copied verbatim. Historically DeepSeek answered to `deepseek-v4-flash` and `deepseek-v4-flash-vision-exp`; today those are aliases that the endpoint resolves to `deepseek-flash`.
+
+To add a model, append it to the profile's `models.json` — the `claude` mapping decides what Opus/Sonnet/Haiku resolve to, the `codex` entry controls whether Codex's own picker offers it. Keep the entries of names that older sessions were recorded with in the Codex catalogue so those sessions stay resumable, then activate:
 
 ```bash
 ai-switch use deepseek -m deepseek-flash
 ```
+
+Model suffixes are proxy-specific: DeepSeek's Claude endpoint accepts and strips a `[1m]` marker (`deepseek-v4-pro[1m]`), while ZAI rejects it as an unknown model — `glm-5.3` is already 1M context and must be used without a suffix. Worth a one-token request before trusting a name in a profile.
 
 ## Session history
 

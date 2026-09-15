@@ -23,7 +23,7 @@ Conversation history is never part of a profile
 import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
 from pathlib import Path
 
-VERSION = "0.2.1"
+VERSION = "0.2.2"
 
 
 def _env_path(name, default):
@@ -323,13 +323,25 @@ def claude_mapping(model, opus=None, sonnet=None, haiku=None, subagent=None):
 
 
 GLM_MODELS = [
-    {"slug": "glm-5.3", "label": "GLM-5.3 flagship (1M context)", "reasoning": "max",
-     "codex": codex_entry("glm-5.3", "Z.ai flagship coding model", ("text",), 0, 1048576, "max"),
-     "claude": claude_mapping("glm-5.3[1m]", opus="glm-5.3[1m]", sonnet="glm-5.3[1m]", haiku="glm-5.3-flash[1m]")},
-    {"slug": "glm-5.3-flash", "label": "GLM-5.3 flash (fast, 1M context)", "reasoning": "high",
-     "codex": codex_entry("glm-5.3-flash", "Z.ai fast model", ("text",), 1, 1048576, "high"),
-     "claude": claude_mapping("glm-5.3-flash[1m]", opus="glm-5.3-flash[1m]", sonnet="glm-5.3-flash[1m]",
-                              haiku="glm-5.3-flash[1m]")},
+    # Model names are exactly what the ZAI endpoint accepts; the ``[1m]`` marker
+    # some proxies use is rejected there (glm-5.3 is 1M context by default), so
+    # Claude Code gets the plain names.
+    {"slug": "glm-5.3", "label": "GLM-5.3 flagship (1M context, text)", "reasoning": "max",
+     "codex": codex_entry("glm-5.3", "Z.ai's latest flagship model", ("text",), 0, 1048576, "max"),
+     "claude": claude_mapping("glm-5.3", opus="glm-5.3", sonnet="glm-5.3", haiku="glm-5.3-flash",
+                              subagent="glm-5.3-flash")},
+    {"slug": "glm-5.3-flash", "label": "GLM-5.3 Flash (fast, text+image, 1M context)", "reasoning": "max",
+     "codex": codex_entry("glm-5.3-flash", "Fast multimodal coding model", ("text", "image"), 1, 1048576, "max"),
+     "claude": claude_mapping("glm-5.3-flash", haiku="glm-5.3-flash", subagent="glm-5.3-flash")},
+    {"slug": "glm-5-turbo", "label": "GLM-5 Turbo (agent-optimized, 200K context)", "reasoning": "max",
+     "codex": codex_entry("glm-5-turbo", "Agent-optimized model", ("text",), 2, 204800, "max"),
+     "claude": {"model": "glm-5-turbo",
+                "env": {"ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-5-turbo",
+                        "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-5-turbo",
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-5-turbo",
+                        "CLAUDE_CODE_SUBAGENT_MODEL": "glm-5-turbo",
+                        # 200K context, so auto-compaction must happen well before 1M.
+                        "CLAUDE_CODE_AUTO_COMPACT_WINDOW": "190000"}}},
 ]
 DEEPSEEK_MODELS = [
     {"slug": "deepseek-flash", "label": "DeepSeek Flash (fast, current generation, text+image)", "reasoning": "high",
