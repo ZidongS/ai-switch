@@ -23,7 +23,7 @@ Conversation history is never part of a profile
 import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
 from pathlib import Path
 
-VERSION = "0.3.4"
+VERSION = "0.3.3"
 
 
 def _env_path(name, default):
@@ -1177,16 +1177,16 @@ def recent_rollouts(limit=8):
 
 
 def unmatched_tool_calls(paths):
-    """Assistant tool calls that have no reply *and* were followed by later turns.
+    """Find assistant tool calls without a tool reply: that breaks the next request.
 
-    Returns [(path, when, count, tool_name, sample_call_id)] newest first. Only
-    calls that later conversation already replayed are reported: a call that is
-    still the newest item of a live rollout is just a command that is running
-    (rollouts are appended as the turn progresses), so it is not a problem.
+    Returns [(path, when, count, sample_call_id)] newest first. A cancelled or
+    aborted command is the usual cause; Codex replays the whole history, and a
+    gateway that converts an incomplete pair to chat tool_calls is rejected by its
+    upstream provider ("insufficient tool messages following tool_calls message").
     """
     broken = []
     for path in paths:
-        calls, outputs, last_user = {}, set(), -1
+        calls, outputs = {}, set()
         try:
             lines = path.read_text(errors="replace").splitlines()
         except OSError:
@@ -1198,17 +1198,16 @@ def unmatched_tool_calls(paths):
                 continue
             payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
             kind, call_id = payload.get("type"), payload.get("call_id")
-            if kind in TOOL_CALL_TYPES and call_id:
-                calls[call_id] = (payload.get("name") or "", len(calls))
-            elif kind in TOOL_OUTPUT_TYPES and call_id:
+            if not call_id:
+                continue
+            if kind in TOOL_CALL_TYPES:
+                calls[call_id] = payload.get("name") or ""
+            elif kind in TOOL_OUTPUT_TYPES:
                 outputs.add(call_id)
-            elif kind == "message" and payload.get("role") == "user":
-                last_user = len(calls)          # a later user turn came after this many calls
-        missing = [call_id for call_id, (_, position) in calls.items()
-                   if call_id not in outputs and position < last_user]
+        missing = [call_id for call_id in calls if call_id not in outputs]
         if missing:
             when = time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))
-            broken.append((path, when, len(missing), calls[missing[0]][0], missing[0]))
+            broken.append((path, when, len(missing), calls[missing[0]], missing[0]))
     return broken
 
 
@@ -1312,16 +1311,15 @@ def check_report():
     broken_sessions = unmatched_tool_calls(checked)
     if broken_sessions:
         path, when, count, tool, call_id = broken_sessions[0]
-        add("warn", f"{len(broken_sessions)} session(s) replay an unanswered tool call",
+        add("warn", f"{len(broken_sessions)} recent session(s) contain an unmatched tool call",
             f"{when}: {count} call(s) without a reply in {path.name} "
-            f"(e.g. {tool or 'tool'} {call_id}), already followed by later turns",
-            "Codex replays the whole history, so a provider that validates tool pairing (DeepSeek's API does, "
-            "ZAI's does not) can reject those turns with \"An assistant message with 'tool_calls' must be "
-            "followed by tool messages responding to each 'tool_call_id'\". Start that work in a new session "
-            "to leave the incomplete pair behind.")
+            f"(e.g. {tool or 'tool'} {call_id})",
+            "A cancelled or aborted command leaves an assistant tool call without its output. Codex replays "
+            "the whole history, so the next request can fail with 'tool_calls must be followed by tool "
+            "messages' on gateways that rewrite the conversation. Run /compact in that session, fork it "
+            "('codex fork'), or start a new one before continuing.")
     elif checked:
-        add("ok", "Recent Codex sessions",
-            f"{len(checked)} session(s) checked, no unanswered tool call was replayed")
+        add("ok", "Recent Codex sessions", f"{len(checked)} session(s) checked, every tool call has a reply")
     for name in ("history.jsonl", "session_index.jsonl"):
         path = CODEX_DIR / name
         add("ok" if path.exists() else "note", f"Codex {name}",

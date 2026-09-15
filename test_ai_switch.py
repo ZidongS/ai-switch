@@ -454,30 +454,27 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("not using the model ai-switch activated", self.out)
         self.assertIn("re-run 'ai-switch use p -m m'", self.out.lower())
 
-    def test_only_replayed_unanswered_tool_calls_are_reported(self):
+    def test_unmatched_tool_call_in_a_recent_session_is_reported(self):
         rollout = self.paths["CODEX_DIR"] / "sessions" / "2026" / "09" / "15" / "rollout-test.jsonl"
         record = lambda payload: json.dumps({"type": "response_item", "payload": payload})
-        user = lambda text: record({"type": "message", "role": "user",
-                                    "content": [{"type": "input_text", "text": text}]})
-        call = record({"type": "function_call", "name": "exec_command", "call_id": "c1"})
-        answer = record({"type": "function_call_output", "call_id": "c1", "output": "ok"})
-
-        # a call that is still the newest item is a running command, not a problem
-        write(rollout, "\n".join([user("go"), call]) + "\n")
+        write(rollout, "\n".join([
+            record({"type": "function_call", "name": "exec_command", "call_id": "c1"}),
+            record({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+            record({"type": "custom_tool_call", "name": "apply_patch", "call_id": "c2"}),
+        ]) + "\n")
         run(self, "doctor")
-        self.assertNotIn("replay an unanswered tool call", self.out)
-
-        # a later turn came after the unanswered call, so it really was replayed
-        write(rollout, "\n".join([user("go"), call, user("still there?")]) + "\n")
+        self.assertIn("unmatched tool call", self.out)
+        self.assertIn("c2", self.out)
+        # once the call is answered the warning goes away
+        write(rollout, "\n".join([
+            record({"type": "function_call", "name": "exec_command", "call_id": "c1"}),
+            record({"type": "function_call_output", "call_id": "c1", "output": "ok"}),
+            record({"type": "custom_tool_call", "name": "apply_patch", "call_id": "c2"}),
+            record({"type": "custom_tool_call_output", "call_id": "c2", "output": "Done!"}),
+        ]) + "\n")
         run(self, "doctor")
-        self.assertIn("replay an unanswered tool call", self.out)
-        self.assertIn("c1", self.out)
-
-        # answered -> silent again
-        write(rollout, "\n".join([user("go"), call, answer, user("thanks")]) + "\n")
-        run(self, "doctor")
-        self.assertNotIn("replay an unanswered tool call", self.out)
-        self.assertIn("no unanswered tool call was replayed", self.out)
+        self.assertNotIn("unmatched tool call", self.out)
+        self.assertIn("every tool call has a reply", self.out)
 
     def test_pinned_claude_model_is_reported(self):
         write(self.paths["CLAUDE"], {"env": {"ANTHROPIC_MODEL": "pinned", "ANTHROPIC_BASE_URL": "https://x"}})
