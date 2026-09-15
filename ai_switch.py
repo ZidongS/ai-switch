@@ -23,7 +23,7 @@ Conversation history is never part of a profile
 import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, textwrap, time
 from pathlib import Path
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 
 # set by --no-color; Style() consults it so every command honours one switch
 COLOR_DISABLED = False
@@ -156,6 +156,10 @@ class Style:
 
 SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 BAR_WIDTH = 16
+BAR_FULL, BAR_EMPTY = "▰", "▱"
+# 256-colour ramp for the bar: cyan → teal → green as it fills
+BAR_RAMP = (45, 44, 43, 49, 48, 47, 46, 82, 118)
+BAR_HEAD, BAR_TRACK = 231, 238
 
 
 class Progress:
@@ -177,16 +181,36 @@ class Progress:
                             and not COLOR_DISABLED and os.environ.get("TERM", "") != "dumb")
         self.started = time.time()
 
-    def _bar(self):
-        filled = max(0, min(BAR_WIDTH, round(BAR_WIDTH * self.done / self.total)))
-        return self.style("█" * filled, "green") + self.style("░" * (BAR_WIDTH - filled), "grey")
+    def _paint(self, text, colour):
+        return f"\x1b[38;5;{colour}m{text}\x1b[0m" if self.style.on else text
+
+    def _bar(self, done=None, width=BAR_WIDTH):
+        done = self.done if done is None else done
+        filled = max(0, min(width, round(width * done / max(self.total, 1))))
+        cells = []
+        for index in range(width):
+            if index >= filled:
+                cells.append(self._paint(BAR_EMPTY, BAR_TRACK))
+            elif index == filled - 1:
+                cells.append(self._paint(BAR_FULL, BAR_HEAD))          # leading edge
+            else:
+                ramp = BAR_RAMP[min(len(BAR_RAMP) - 1, index * len(BAR_RAMP) // width)]
+                cells.append(self._paint(BAR_FULL, ramp))
+        return "".join(cells)
+
+    def _line(self, head, text, detail="", done=None):
+        done = self.done if done is None else done
+        percent = min(100, round(100 * done / max(self.total, 1)))
+        counter = self.style(f"{int(round(done))}/{self.total}", "grey")
+        tail = f"  {self.style(detail, 'grey')}" if detail else ""
+        return (f"\r\x1b[K  {head} {self._bar(done)} {self.style(f'{percent:>3}%', 'green')} "
+                f"{counter}  {text}{tail}")
 
     def animate(self, text, frames=6, delay=0.03):
         if not self.enabled:
             return
         for index in range(frames):
-            self.stream.write(f"\r\x1b[K  {self.style(SPINNER[index % len(SPINNER)], 'cyan')} "
-                              f"{text}  {self._bar()}")
+            self.stream.write(self._line(self.style(SPINNER[index % len(SPINNER)], "cyan"), text))
             self.stream.flush()
             time.sleep(delay)
 
@@ -197,24 +221,54 @@ class Progress:
             self.done += 1
             return
         self.done += 1
-        tail = f"  {self.style(detail, 'grey')}" if detail else ""
-        self.stream.write(f"\r\x1b[K  {self.style('✓', 'green')} {text}{tail}  {self._bar()}\n")
+        self.stream.write(self._line(self.style("✓", "green"), text, detail) + "\n")
+        self.stream.flush()
+
+    def sweep(self, text="all set", frames=10, delay=0.025):
+        """Fill the bar from zero to full, so it always finishes at 100%."""
+        if not self.enabled:
+            return
+        for index in range(frames + 1):
+            filled = round(BAR_WIDTH * index / frames)
+            self.stream.write(self._line(self.style(SPINNER[index % len(SPINNER)], "cyan"),
+                                         text, done=filled * self.total / BAR_WIDTH))
+            self.stream.flush()
+            time.sleep(delay)
+        self.done = self.total
+        self.stream.write(f"\r\x1b[K  {self.style('✓', 'green')} {self._bar()} "
+                          f"{self.style('100%', 'green')} {self.style(f'{self.total}/{self.total}', 'grey')}"
+                          f"  {text}\n")
         self.stream.flush()
 
     def result(self, title, rows):
         elapsed = time.time() - self.started
         if not self.enabled:
             print(title)
-            for label, value in rows:
+            for row in rows:
+                label, value = row[0], row[1]
                 print(f"{label}: {value}" if label else value)
             return
-        self.stream.write("\n" + self.style.rule() + "\n")
-        self.stream.write(f"  {self.style(title, 'bold', 'green')}   "
-                          f"{self.style(f'({elapsed:.2f}s)', 'grey')}\n")
-        for label, value in rows:
-            prefix = f"  {self.style(label, 'grey')}" if label else "  "
-            self.stream.write(f"{prefix}  {value}\n")
-        self.stream.write(self.style.rule() + "\n")
+        entries = []
+        for row in rows:
+            label, plain = row[0], row[1]
+            styled = row[2] if len(row) > 2 and row[2] else plain
+            entries.append((label, plain, styled))
+        head, stamp = f"✦ {title}", f"({elapsed:.2f}s)"
+        # content width between the two border characters: one space of padding on
+        # each side, an 8-character label column, then the value
+        inner = max(len(head) + 2 + len(stamp), 8 + max(len(p) for _, p, _ in entries) + 2)
+        top = "╭" + "─" * inner + "╮"
+        self.stream.write("\n" + self.style(top, "grey") + "\n")
+        self.stream.write(self.style("│", "grey") + " "
+                          + self.style(head, "bold", "green")
+                          + " " * (inner - 2 - len(head) - len(stamp))
+                          + self.style(stamp, "grey") + " " + self.style("│", "grey") + "\n")
+        self.stream.write(self.style("├" + "─" * inner + "┤", "grey") + "\n")
+        for label, plain, styled in entries:
+            pad = " " * max(0, inner - 10 - len(plain))
+            self.stream.write(self.style("│", "grey") + " " + self.style(f"{label:<8}", "grey")
+                              + styled + pad + " " + self.style("│", "grey") + "\n")
+        self.stream.write(self.style("╰" + "─" * inner + "╯", "grey") + "\n")
         self.stream.flush()
 
 
@@ -757,21 +811,39 @@ def write_detail(path, data):
     return ""
 
 
+def planned_steps(changes):
+    """How many progress steps apply_changes will report: backup + files + state."""
+    backup_needed = any(changes[path] is not None and path.exists() for path in changes)
+    return len(changes) + 1 + (1 if backup_needed else 0)
+
+
 def apply_changes(changes, name, slug, dry_run=False, progress=None):
     backup = backup_dir()
     written, backed_up = {}, 0
-    for path in sorted(changes, key=str):
+    plan = sorted(changes, key=str)
+    if dry_run:
+        for path in plan:
+            kind = "remove" if changes[path] is None else "write"
+            print(f"dry-run: would {kind} {display_path(path)}")
+        return None
+    # every file that will be overwritten is copied out of the way first, so a
+    # failure halfway through never leaves the agents without their previous files
+    to_copy = [path for path in plan if changes[path] is not None and path.exists()]
+    if to_copy and progress:
+        progress.animate(f"backing up {len(to_copy)} file(s)")
+    for path in to_copy:
+        keep_copy(backup, path)
+        backed_up += 1
+    if to_copy and progress:
+        progress.step(f"backup {backed_up} file(s)", display_path(backup))
+    for path in plan:
         data = changes[path]
-        label = f"remove {display_path(path)}" if data is None else f"write {display_path(path)}"
-        if dry_run:
-            print(f"dry-run: would {label}")
-            continue
         if is_history_path(path):
             raise ValueError(f"refusing to manage agent history file: {path}")
         if data is None:
+            if progress:
+                progress.animate(f"removing {display_path(path)}")
             if path.exists():
-                if progress:
-                    progress.animate(f"removing {display_path(path)}")
                 removed = backup / "removed"
                 removed.mkdir(parents=True, exist_ok=True)
                 secure(removed)
@@ -779,29 +851,29 @@ def apply_changes(changes, name, slug, dry_run=False, progress=None):
                 backed_up += 1
                 written[str(path)] = "removed"
             if progress:
-                progress.step(f"remove {display_path(path)}", "backed up first")
+                progress.step(f"remove {display_path(path)}", "copy kept in the backup")
             else:
                 print(f"Removed {display_path(path)}")
             continue
         if progress:
             progress.animate(f"writing {display_path(path)}")
-        if path.exists():
-            keep_copy(backup, path)
-            backed_up += 1
         write_atomic(path, data)
         written[str(path)] = digest(data)
         if progress:
             progress.step(f"write {display_path(path)}", write_detail(path, data))
         else:
             print(f"Wrote {display_path(path)}")
-    if not dry_run:
-        state = load_state()
-        models = state.get("models") if isinstance(state.get("models"), dict) else {}
-        if slug:
-            models[name] = slug
-        state.update({"profile": name, "models": models, "files": written, "updated": timestamp()})
-        save_state(state)
-        write_atomic(CURRENT, name + "\n")
+    if progress:
+        progress.animate("saving profile state")
+    state = load_state()
+    models = state.get("models") if isinstance(state.get("models"), dict) else {}
+    if slug:
+        models[name] = slug
+    state.update({"profile": name, "models": models, "files": written, "updated": timestamp()})
+    save_state(state)
+    write_atomic(CURRENT, name + "\n")
+    if progress:
+        progress.step("save profile state", f"{name} is now the active profile")
     return backup if backed_up else None
 
 
@@ -849,7 +921,7 @@ def cmd_use(args):
         print(f"Note: {note}", file=sys.stderr)
     plain = getattr(args, "plain", False)
     style = Style(force_off=plain)
-    progress = Progress(len(changes) + 1, style, animate=not plain)
+    progress = Progress(planned_steps(changes), style, animate=not plain)
     if not args.dry_run and progress.enabled:
         progress.animate(f"activating {name}")
     if not progress.enabled:
@@ -858,14 +930,22 @@ def cmd_use(args):
     if not args.dry_run:
         backup_text = display_path(backup) if backup else "nothing to back up (no files existed yet)"
         if progress:
-            rows = [("profile", f"{style(name, 'bold', 'cyan')}"
-                               + (style("   only this model is published", "grey") if args.pin and slug else "")),
-                    ("default", f"{style(str(slug), 'green')}   {style('new sessions', 'grey')}" if slug else "-"),
-                    ("models ",
-                     f"{len(catalog['models'])} published   {style('pick one inside codex with /model', 'grey')}"
-                     if catalog else "no model list"),
-                    ("backup ", style(backup_text, "grey")),
-                    ("next   ", "restart claude/codex so they reload their configuration")]
+            progress.sweep("activation complete")
+            profile_tail = f"  ·  only {slug} published" if args.pin and slug else ""
+            models_tail = f"{len(catalog['models'])} published  ·  switch inside codex with /model" \
+                if catalog else "no model list"
+            plain_models = models_tail
+            styled_models = (style(f"{len(catalog['models'])} published", "green")
+                             + style("  ·  switch inside codex with /model", "grey")) if catalog \
+                else style("no model list", "grey")
+            if not catalog:
+                plain_models = "no model list"
+            rows = [("profile", name + profile_tail,
+                     style(name, "bold", "cyan") + (style(profile_tail, "grey") if profile_tail else "")),
+                    ("default", str(slug or "-"), style(str(slug), "bold", "green")),
+                    ("models", plain_models, styled_models),
+                    ("backup", backup_text, style(backup_text, "grey")),
+                    ("next", "restart claude/codex to reload", style("restart claude/codex to reload", "yellow"))]
             progress.result(f"{name} is active", rows)
         else:
             print(f"Active profile: {name}" + (f"\nDefault model: {slug} (new sessions)" if slug else ""))

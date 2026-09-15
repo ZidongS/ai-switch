@@ -494,13 +494,17 @@ class PresentationTest(unittest.TestCase):
         self.assertTrue(progress.enabled)
         progress.animate("activating p", frames=2, delay=0)
         progress.step("write ~/.codex/config.toml", "model m-one")
-        progress.result("p is active", [("profile", "p"), ("models ", "2 published")])
+        progress.sweep("activation complete", frames=3, delay=0)
+        progress.result("p is active", [("profile", "p"), ("models", "2 published", "2 published")])
         text = stream.getvalue()
         self.assertIn("activating p", text)
         self.assertIn("✓", text)
-        self.assertIn("█", text)
+        self.assertIn("▰", text)          # the bar fills with a gradient
+        self.assertIn("▱", text)
+        self.assertIn("100%", text)       # …and always ends completely full
         self.assertIn("p is active", text)
         self.assertIn("2 published", text)
+        self.assertIn("╭", text)          # rounded result card
 
     def test_current_lists_every_profile_and_its_models(self):
         write(self.paths["PROFILES"] / "alpha" / "codex-config.toml", CODEX_CONFIG)

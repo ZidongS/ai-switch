@@ -70,19 +70,22 @@ default for new sessions is the one you last used, or the profile default. Add `
 asked, or `-m/--model` to set the default directly.
 
 ```text
-  ⠹ writing ~/.codex/models.json  ████████░░░░░░░░
-  ✓ write ~/.claude/settings.json  opus/sonnet/haiku → glm-5.3[1m]   ████░░░░░░░░░░░░
-  ✓ write ~/.codex/config.toml     model glm-5.3 · effort max        ████████░░░░░░░░
-  ✓ write ~/.codex/models.json     3 model(s)                        ████████████░░░░
-────────────────────────────────────────────────────────────────────
-  glm is active   (0.73s)
-  profile  glm
-  default  glm-5.3   new sessions
-  models   3 published   pick one inside codex with /model
-  backup   ~/.config/ai-switch/backups/20260915-203657
-  next     restart claude/codex so they reload their configuration
-────────────────────────────────────────────────────────────────────
+  ⠸ ▰▰▰▰▰▰▱▱▱▱▱▱▱▱▱▱  38% 2/5  writing ~/.codex/models.json
+  ✓ ▰▰▰▰▰▰▰▰▰▰▰▰▱▱▱▱  75% 4/5  write ~/.codex/models.json  3 model(s)
+  ✓ ▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰▰ 100% 5/5  save profile state  glm is now the active profile
+╭──────────────────────────────────────────────────────────╮
+│ ✦ glm is active                                 (0.73s)  │
+├──────────────────────────────────────────────────────────┤
+│ profile glm                                              │
+│ default glm-5.3                                          │
+│ models  3 published  ·  switch inside codex with /model  │
+│ backup  ~/.config/ai-switch/backups/20260915-203657      │
+│ next    restart claude/codex to reload                   │
+╰──────────────────────────────────────────────────────────╯
 ```
+
+The bar is a colour ramp (cyan → green) with a bright leading edge and it always finishes completely
+filled at 100%, followed by a short sweep as the closing flourish.
 
 The progress animation needs a terminal — piped output, `TERM=dumb`, `--plain` and `--no-color` keep the
 plain one-line-per-action form (handy for scripts). `NO_COLOR=1` mutes the colours but keeps the spinner.
