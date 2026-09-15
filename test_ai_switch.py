@@ -235,6 +235,29 @@ class UseTest(unittest.TestCase):
         self.assertIn("config.toml", names)
         self.assertIn("settings.json", names)
 
+    def test_use_does_not_prompt_and_keeps_the_whole_menu(self):
+        original = sys.stdin
+        sys.stdin = io.StringIO("")          # a prompt would hit EOF and fail the test
+        try:
+            self.assertEqual(run(self, "use", "p"), 0)
+        finally:
+            sys.stdin = original
+        self.assertIn("Default model: m-one", self.out)
+        self.assertIn("Published models: 2", self.out)
+        catalog = json.loads(self.paths["CODEX_MODELS"].read_text())
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["m-one", "m-two"])
+
+    def test_choose_asks_which_model_new_sessions_start_with(self):
+        original = sys.stdin
+        sys.stdin = io.StringIO("2\n")
+        try:
+            self.assertEqual(run(self, "use", "p", "--choose"), 0)
+        finally:
+            sys.stdin = original
+        self.assertIn('model = "m-two"', self.paths["CODEX"].read_text())
+        catalog = json.loads(self.paths["CODEX_MODELS"].read_text())
+        self.assertEqual(len(catalog["models"]), 2)   # choosing does not hide the others
+
     def test_pin_publishes_only_the_activated_model(self):
         self.assertEqual(run(self, "use", "p", "-m", "m-two", "--pin"), 0)
         catalog = json.loads(self.paths["CODEX_MODELS"].read_text())

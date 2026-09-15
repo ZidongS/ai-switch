@@ -23,7 +23,7 @@ Conversation history is never part of a profile
 import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
 from pathlib import Path
 
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 
 
 def _env_path(name, default):
@@ -476,7 +476,7 @@ def resolve_model(catalog, token):
     raise ValueError(f"unknown model '{token}'; this profile offers: {available}")
 
 
-def pick_model(catalog, requested, fallback, assume_yes=False):
+def pick_model(catalog, requested, fallback, assume_yes=False, force=False):
     """Choose the model to activate (no prompting when requested/non-interactive)."""
     if not catalog:
         return requested
@@ -486,7 +486,7 @@ def pick_model(catalog, requested, fallback, assume_yes=False):
         return resolve_model(catalog, requested)
     if fallback not in slugs:
         fallback = catalog["default"] if catalog["default"] in slugs else slugs[0]
-    if assume_yes or not sys.stdin.isatty() or len(entries) == 1:
+    if assume_yes or (not force and (not sys.stdin.isatty() or len(entries) == 1)):
         return fallback
     print(f"This profile provides {len(entries)} models:")
     for index, entry in enumerate(entries, 1):
@@ -700,15 +700,20 @@ def cmd_use(args):
     if not any((d / profile_file).exists() for profile_file in PROFILE_FILES):
         raise ValueError(f"profile '{name}' has no Codex or Claude configuration to activate")
     catalog = load_catalog(d)
-    fallback = args.model or last_model(name) or (catalog or {}).get("default")
-    if catalog and args.model and catalog.get("open_ended"):
+    fallback = last_model(name) or (catalog or {}).get("default")
+    slug = args.model or fallback
+    if args.model and catalog and catalog.get("open_ended"):
         try:
             slug = resolve_model(catalog, args.model)
         except ValueError:
             slug = args.model
             print(f"Note: '{args.model}' is not in the profile's model list; using it as-is.", file=sys.stderr)
-    else:
-        slug = pick_model(catalog, args.model, fallback, assume_yes=args.yes)
+    elif args.model and catalog:
+        slug = resolve_model(catalog, args.model)
+    elif catalog and args.choose:
+        # Picking a model here only sets the default for new sessions; every model
+        # of the profile is published, so it can also be changed inside the agent.
+        slug = pick_model(catalog, None, fallback, force=True)
     if slug and catalog is None:
         print(f"Note: profile '{name}' has no model list, using '{slug}' as-is.", file=sys.stderr)
     changes, notes = compute_changes(d, slug, pin=args.pin)
@@ -716,9 +721,13 @@ def cmd_use(args):
         print(f"Note: {note}", file=sys.stderr)
     backup = apply_changes(changes, name, slug, dry_run=args.dry_run)
     if not args.dry_run:
-        print(f"Active profile: {name}" + (f"\nActive model: {slug}" if slug else ""))
+        print(f"Active profile: {name}" + (f"\nDefault model: {slug} (new sessions)" if slug else ""))
         if args.pin and slug:
             print(f"Pinned: only '{slug}' is published, so Codex cannot switch to another model.")
+        elif catalog:
+            print(f"Published models: {len(catalog['models'])} - switch any time with /model inside "
+                  "codex (Claude Code uses its Opus/Sonnet/Haiku mappings), or change the default "
+                  "with -m/--model.")
         print(f"Backup: {backup}" if backup else "Backup: nothing to back up (no files existed yet)")
         print("Restart claude/codex so they reload their configuration.")
         if not args.no_check:
@@ -1388,10 +1397,12 @@ files inside a profile are switched. Restart claude/codex after switching."""
 
     p = sub.add_parser("use", help="activate a profile (optionally choosing a model)")
     p.add_argument("name")
-    p.add_argument("-m", "--model", help="model to activate (name, unique prefix, or 1-based index)")
+    p.add_argument("-m", "--model", help="set the default model for new sessions (name, unique prefix, or index)")
+    p.add_argument("--choose", action="store_true",
+                   help="ask which model the new sessions should start with (the others stay selectable in /model)")
     p.add_argument("--pin", action="store_true",
                    help="publish only this model, so Codex's own picker cannot switch to another one")
-    p.add_argument("-y", "--yes", action="store_true", help="never prompt; use the default model")
+    p.add_argument("-y", "--yes", action="store_true", help="accepted for compatibility; use never prompts by default")
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
     p.add_argument("--no-check", action="store_true", help="skip the session-history health check")
     p.set_defaults(fn=cmd_use)

@@ -64,13 +64,26 @@ Select `glm` or `deepseek`, enter the API key, and activate the generated config
 ai-switch use glm
 ```
 
-`use` lists the models the profile offers and remembers your choice:
+`use` activates the profile and does **not** ask anything: the profile's whole model list is published, so you
+pick the model inside the agent with `/model` (Codex) or its Opus/Sonnet/Haiku categories (Claude Code). The
+default for new sessions is the one you last used, or the profile default. Add `--choose` if you want to be
+asked, or `-m/--model` to set the default directly.
 
 ```text
-This profile provides 2 models:
+Active profile: glm
+Default model: glm-5.3 (new sessions)
+Published models: 3 - switch any time with /model inside codex (Claude Code uses its
+Opus/Sonnet/Haiku mappings), or change the default with -m/--model.
+```
+
+With `--choose` you get the picker instead:
+
+```text
+This profile provides 3 models:
   1) glm-5.3         GLM-5.3 flagship (1M context)  [default]
-  2) glm-5.3-flash   GLM-5.3 flash (fast, 1M context)
-Select model [1-2, Enter=glm-5.3, q=cancel]:
+  2) glm-5.3-flash   GLM-5.3 Flash (fast, text+image, 1M context)
+  3) glm-5-turbo     GLM-5 Turbo (agent-optimized, 200K context)
+Select model [1-3, Enter=glm-5.3, q=cancel]:
 ```
 
 For scripts and servers, choose without prompting (name, unique prefix, or index):
