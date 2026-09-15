@@ -119,7 +119,7 @@ For every model a profile records the Codex catalogue entry and the Claude Code 
 * Codex: the top-level `model` (and `model_reasoning_effort`), plus a `~/.codex/models.json` catalogue that lists **every** model of the profile, which is what makes Codex's own `/model` picker show them.
 * Claude Code: the default model in `settings.json` plus the Opus/Sonnet/Haiku mappings. The presets map the three categories to *different* provider models where they exist, and they never set `ANTHROPIC_MODEL`, because a pinned environment model overrides your selection and makes `/model` do nothing.
 
-The `glm` and `deepseek` presets ship multi-model lists. A custom (OpenAI-compatible) profile is open-ended: it does not publish a catalogue, and `ai-switch use NAME --model anything` accepts any model name the endpoint serves.
+The `glm` and `deepseek` presets ship multi-model lists. A custom (OpenAI-compatible) profile is open-ended as well: when you create it you can name **several models at once, separated by spaces or commas** (for example `DeepSeek-V4.1-Flash Kimi-K3 Qwen3.8-Max`), and those become the profile's catalogue — both agents can then pick them. Any other name the endpoint serves still works with `ai-switch use NAME --model <name>`, and it is added to the catalogue when you use it.
 
 ### When a provider adds or renames a model
 
@@ -166,7 +166,7 @@ ai-switch doctor --fix    # quarantine damaged Codex runtime databases
   export CODEX_SQLITE_HOME=/var/tmp/codex-sqlite-$USER   # a local, persistent directory
   ```
 
-  `ai-switch add` offers to write `sqlite_home` into the generated Codex configuration when it detects a network filesystem.
+  Codex only honours the **environment variable**: a `sqlite_home` key in `config.toml` is parsed but ignored (checked with `codex doctor`). `ai-switch add` asks for a local directory when it detects a network filesystem, creates it and prints the export line to put in your shell profile; `ai-switch doctor` reports the variable's status.
 * **A stale model catalogue.** A catalogue left behind by the previous provider hides the new provider's models from Codex and makes sessions that used them unresumable. ai-switch removes that leftover file (only if it wrote it itself, and it backs it up first), and `doctor` verifies the configured model exists in the catalogue.
 * **Disabled history persistence** (`[history] persistence = "none"`), a Claude Code model pinned by `ANTHROPIC_MODEL`, and `claude`/`codex` processes that are running while you switch and will rewrite their configuration on exit.
 

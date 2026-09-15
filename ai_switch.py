@@ -23,7 +23,7 @@ Conversation history is never part of a profile
 import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
 from pathlib import Path
 
-VERSION = "0.2.2"
+VERSION = "0.3.0"
 
 
 def _env_path(name, default):
@@ -267,8 +267,9 @@ def build_claude_settings(live, profile_settings, entry):
     env = {k: v for k, v in live_env.items() if k not in CLAUDE_PROVIDER_ENV}
     env.update({k: v for k, v in prof_env.items() if k not in CLAUDE_MODEL_PINS})
     if entry:
-        env.update(entry.get("claude", {}).get("env") or {})
-        out["model"] = entry["claude"].get("model") or entry["slug"]
+        mapped = entry.get("claude") if isinstance(entry.get("claude"), dict) else {}
+        env.update(mapped.get("env") or {})
+        out["model"] = mapped.get("model") or entry["slug"]
     elif "model" in profile_settings:
         out["model"] = profile_settings["model"]
     out["env"] = env
@@ -320,6 +321,22 @@ def claude_mapping(model, opus=None, sonnet=None, haiku=None, subagent=None):
     if subagent:
         env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent
     return {"model": model, "env": env}
+
+
+def adhoc_model(slug, index=99):
+    """Model entry for an endpoint whose catalogue we do not know (custom provider).
+
+    Every Claude Code category points at the same model: a gateway usually serves
+    one namespace, so Claude's own alias names (``claude-sonnet-*``) would be
+    rejected by it.
+    """
+    return {"slug": slug, "label": "custom model", "reasoning": "",
+            "codex": codex_entry(slug, "custom model", ("text",), index, 1048576, "high"),
+            "claude": claude_mapping(slug, opus=slug, sonnet=slug, haiku=slug, subagent=slug)}
+
+
+def split_models(text):
+    return [part for part in re.split(r"[,\s]+", text or "") if part]
 
 
 GLM_MODELS = [
@@ -530,11 +547,17 @@ def compute_changes(d, slug):
 
     text = read_text(d / "codex-config.toml")
     codex_catalog = None
+    # A model that is used but not listed (open-ended custom endpoint, or a legacy
+    # profile without a model list) gets a generated entry so that both agents are
+    # pointed at the requested model instead of falling back to the snapshot.
+    if slug and entry is None:
+        entry = adhoc_model(slug)
+        if catalog and catalog.get("open_ended"):
+            catalog = dict(catalog, models=catalog["models"] + [entry])
     if text is not None:
-        # Open-ended providers (custom endpoints) are not pinned to a catalogue;
-        # everything else publishes every selectable model so the picker inside
-        # Codex lists them all.
-        if catalog and (not catalog.get("open_ended") or (d / "codex-models.json").exists()):
+        # Every profile publishes its models, so the picker inside Codex lists
+        # them too.
+        if catalog:
             codex_catalog = build_codex_catalog(d, catalog)
         if codex_catalog is not None:
             catalog_path = catalog_target(text, CODEX_MODELS)
@@ -657,9 +680,8 @@ def codex_health_warnings(check_codex=True):
             if status != "ok":
                 warnings.append(f"Codex runtime DB {db.name} is unusable ({detail}) - sessions may be missing "
                                 "from the resume picker; run 'ai-switch doctor --fix'")
-    running = running_agents()
-    if running:
-        warnings.append("running now: " + ", ".join(running) +
+    if running_agents():
+        warnings.append("running now: " + running_agents_summary() +
                         " - restart them after switching, a running agent rewrites its config on exit")
     return warnings
 
@@ -912,15 +934,17 @@ def cmd_add(_):
     if preset:
         chosen = preset["models"]
         print(f"{provider} preset offers: " + ", ".join(m["slug"] for m in chosen))
-        wanted = _ask("Models to include (comma separated, Enter=all)", "all")
+        wanted = _ask("Models to include (space or comma separated, Enter=all)", "all")
         if wanted.lower() not in ("all", ""):
-            names = [part.strip() for part in wanted.split(",") if part.strip()]
+            names = split_models(wanted)
             by_slug = {m["slug"]: m for m in chosen}
             chosen = []
             for token in names:
-                slug = [s for s in by_slug if s.lower().startswith(token.lower())]
+                exact = [s for s in by_slug if s.lower() == token.lower()]
+                slug = exact or [s for s in by_slug if s.lower().startswith(token.lower())]
                 if len(slug) != 1:
-                    raise ValueError(f"unknown model '{token}'")
+                    raise ValueError(f"unknown or ambiguous model '{token}'"
+                                     f" (choose one of: {', '.join(by_slug)})")
                 chosen.append(by_slug[slug[0]])
         default = _ask("Default model", chosen[0]["slug"])
         default = resolve_model({"models": chosen}, default)
@@ -931,13 +955,21 @@ def cmd_add(_):
         if not endpoint:
             raise ValueError("an endpoint URL is required")
         claude_endpoint = endpoint[:-3].rstrip("/") if endpoint.endswith("/v1") else endpoint.rstrip("/")
-        slug = _ask("Model name")
-        if not slug:
-            raise ValueError("a model name is required")
-        chosen = [{"slug": slug, "label": "custom model", "reasoning": "",
-                   "codex": codex_entry(slug, "custom model", ("text",), 0, 1048576, "high"),
-                   "claude": claude_mapping(slug)}]
-        default, common_env = slug, {}
+        names = split_models(_ask("Model name(s) (space or comma separated, e.g. 'Big-Model Small-Model')"))
+        if not names:
+            raise ValueError("at least one model name is required")
+        chosen = []
+        for index, name in enumerate(names):
+            model = adhoc_model(name, index)
+            if len(names) > 1:
+                model["label"] = f"custom model (use --model {name})"
+            chosen.append(model)
+        default = chosen[0]["slug"]
+        if len(chosen) > 1:
+            print("This endpoint is open ended: any name works with "
+                  f"'ai-switch use <profile> --model <name>', and the ones listed above appear in the picker.")
+            default = resolve_model({"models": chosen}, _ask("Default model", chosen[0]["slug"]))
+        common_env = {}
     name = _ask("Profile name")
     if not name:
         raise ValueError("a profile name is required")
@@ -950,7 +982,7 @@ def cmd_add(_):
         suggested = f"/var/tmp/codex-sqlite-{os.environ.get('USER', 'user')}"
         print(f"\n{CODEX_DIR} is on a network filesystem ({fstype_for(CODEX_DIR)}); SQLite runtime databases "
               "can be corrupted there, which makes sessions disappear.")
-        sqlite_home = _ask("Local directory for Codex runtime databases (Enter=leave default)", suggested)
+        sqlite_home = _ask("Local directory for Codex runtime databases (Enter=skip)", suggested)
     d = profile(name)
     blank_profile_dir(d)
     catalog = {"version": 2, "provider": provider, "default": default, "models": chosen,
@@ -965,17 +997,15 @@ def cmd_add(_):
                     .replace("@CATALOG@", display_path(catalog_path))
                     .replace("@ENDPOINT@", preset["endpoint"]).replace("@KEY@", key))
         else:
-            # A custom endpoint usually serves models we cannot know about, so no
-            # catalogue is written: Codex keeps listing the models the endpoint has.
+            # A gateway often serves dozens of models; the catalogue holds the ones
+            # you named, and ``use --model <other>`` extends it on demand.
             base = (f'model = "{default}"\nmodel_provider = "custom"\npreferred_auth_method = "apikey"\n'
-                    f'forced_login_method = "api"\n\n[model_providers.custom]\nname = "custom"\n'
+                    f'forced_login_method = "api"\nmodel_catalog_json = "{display_path(CODEX_MODELS)}"\n\n'
+                    f'[model_providers.custom]\nname = "custom"\n'
                     f'base_url = "{endpoint}"\nwire_api = "responses"\n'
                     f'requires_openai_auth = true\nexperimental_bearer_token = "{key}"\n')
-        if sqlite_home:
-            base += f'\n# Keeps Codex runtime SQLite databases off the network filesystem.\nsqlite_home = "{display_path(expand(sqlite_home))}"\n'
         write_atomic(d / "codex-config.toml", base)
-        if preset:
-            write_atomic(d / "codex-models.json", json.dumps(build_codex_catalog(d, catalog), indent=2) + "\n")
+        write_atomic(d / "codex-models.json", json.dumps(build_codex_catalog(d, catalog), indent=2) + "\n")
         write_atomic(d / "codex-auth.json", json.dumps({"OPENAI_API_KEY": key}, indent=2) + "\n")
     if clients in ("both", "claude"):
         env = {"ANTHROPIC_BASE_URL": claude_endpoint, "ANTHROPIC_AUTH_TOKEN": key}
@@ -986,6 +1016,16 @@ def cmd_add(_):
                                                  "provider": provider, "default_model": default}, indent=2) + "\n")
     print(f"\nCreated profile: {name}")
     print(f"Activate it with: ai-switch use {name}   (choose between {len(chosen)} model(s))")
+    if sqlite_home:
+        # Codex reads this from the environment only: a `sqlite_home` key in
+        # config.toml is accepted but ignored (verified with `codex doctor`).
+        target = expand(sqlite_home)
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        print(f"\nKeep Codex's runtime databases off {fstype_for(CODEX_DIR)} by exporting this before "
+              f"starting codex (add it to ~/.bashrc):\n    export CODEX_SQLITE_HOME={sqlite_home}")
     return 0
 
 
@@ -1099,21 +1139,47 @@ def running_agents():
     return names
 
 
+def running_agents_summary(limit=4):
+    """A short, readable list (this file server runs dozens of agents)."""
+    running = running_agents()
+    if len(running) <= limit:
+        return ", ".join(running)
+    return ", ".join(running[:limit]) + f" and {len(running) - limit} more"
+
+
 def check_report():
     checks = []
 
     def add(status, title, detail, hint=""):
         checks.append({"status": status, "title": title, "detail": detail, "hint": hint})
 
+    sqlite_home = os.environ.get("CODEX_SQLITE_HOME", "")
+    sqlite_home_fs = fstype_for(expand(sqlite_home)) if sqlite_home else ""
     for label, path in (("CODEX_HOME", CODEX_DIR), ("Claude config", CLAUDE_DIR), ("ai-switch home", ROOT)):
         fs_type = fstype_for(path) or "unknown"
         if fs_type in NETWORK_FS:
-            add("warn", f"{label} is on {fs_type}", f"{path} ({fs_type})",
-                "SQLite databases (Codex runtime state, goals, memories, logs) can be corrupted on network "
-                "filesystems, which makes sessions disappear. Point CODEX_SQLITE_HOME at a local disk, e.g. "
-                f"export CODEX_SQLITE_HOME=/var/tmp/codex-sqlite-$USER")
+            moved = path == CODEX_DIR and sqlite_home and sqlite_home_fs not in NETWORK_FS
+            detail = f"{path} ({fs_type})"
+            if path == CODEX_DIR and sqlite_home:
+                detail += f", runtime databases in {sqlite_home} ({sqlite_home_fs or 'unknown'})"
+            if moved:
+                add("warn", f"{label} is on {fs_type}, runtime databases are not", detail,
+                    "Codex keeps state/log/goal databases in CODEX_SQLITE_HOME now; only history.jsonl and "
+                    "the rollout files stay on the network share.")
+            else:
+                hint = ("SQLite databases (Codex runtime state, goals, memories, logs) can be corrupted on network "
+                        "filesystems, which makes sessions disappear. Codex only honours the environment variable "
+                        "(a sqlite_home config key is ignored):\n"
+                        "        export CODEX_SQLITE_HOME=/var/tmp/codex-sqlite-$USER")
+                add("warn", f"{label} is on {fs_type}", detail, hint if path == CODEX_DIR else "")
         else:
             add("ok", f"{label} filesystem", f"{path} ({fs_type})")
+    if sqlite_home:
+        if sqlite_home_fs in NETWORK_FS:
+            add("warn", "CODEX_SQLITE_HOME is also on a network filesystem", f"{sqlite_home} ({sqlite_home_fs})",
+                "Pick a directory on a local disk, otherwise the runtime databases keep getting corrupted.")
+        else:
+            add("ok", "CODEX_SQLITE_HOME", f"{sqlite_home} ({sqlite_home_fs or 'unknown'})")
 
     text = read_text(CODEX) or ""
     persisted = section_value(text, "history", "persistence")
@@ -1132,9 +1198,19 @@ def check_report():
         add("fail", "Codex model catalogue is missing", f"{catalog_path} does not exist",
             "Re-run 'ai-switch use <profile>' to rewrite it.")
     elif slugs and model and model not in slugs:
-        add("fail", "Codex model catalogue does not contain the configured model",
-            f"model = {model}, catalogue has {', '.join(str(s) for s in slugs)}",
-            "Codex refuses to resume sessions whose model is unknown. Re-run 'ai-switch use <profile>'.")
+        open_ended = False
+        try:
+            open_ended = bool(json.loads((PROFILES / active_profile() / "models.json").read_text()).get("open_ended"))
+        except (OSError, ValueError):
+            pass
+        detail = f"model = {model}, catalogue has {', '.join(str(s) for s in slugs)}"
+        if open_ended:
+            add("warn", "Codex model catalogue does not list the configured model", detail,
+                "The active profile describes an open-ended endpoint, so any model name is allowed; "
+                "'ai-switch use NAME -m MODEL' adds it to the catalogue.")
+        else:
+            add("fail", "Codex model catalogue does not contain the configured model", detail,
+                "Codex refuses to resume sessions whose model is unknown. Re-run 'ai-switch use <profile>'.")
     elif slugs:
         add("ok", "Codex model catalogue", f"{len(slugs)} model(s): {', '.join(str(s) for s in slugs)}")
     else:
@@ -1205,7 +1281,7 @@ def check_report():
 
     running = running_agents()
     if running:
-        add("warn", "Agents are running", ", ".join(running),
+        add("warn", "Agents are running", running_agents_summary() + f" ({len(running)} process(es))",
             "A running agent rewrites its configuration on exit and may overwrite the switch; restart it after switching.")
     else:
         add("ok", "No agent processes running", "config.toml / settings.json are not being rewritten")

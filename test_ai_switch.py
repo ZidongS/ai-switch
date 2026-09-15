@@ -1,4 +1,4 @@
-import contextlib, io, json, os, sqlite3, tempfile, unittest
+import contextlib, io, json, os, sqlite3, sys, tempfile, unittest
 from pathlib import Path
 
 import ai_switch
@@ -287,16 +287,82 @@ class LegacyProfileTest(unittest.TestCase):
         self.assertEqual(self.paths["CODEX_MODELS"].read_text(), hand_written)
         self.assertIn("modified by hand", self.err)
 
-    def test_open_ended_profile_does_not_publish_a_catalogue(self):
+    def test_open_ended_profile_publishes_listed_models_and_accepts_new_ones(self):
         open_ended = self.paths["PROFILES"] / "custom"
         write(open_ended / "codex-config.toml", 'model = "x"\nmodel_provider = "custom"\n')
         write(open_ended / "models.json", {"version": 2, "open_ended": True, "default": "x",
                                            "models": [{"slug": "x", "codex": {"slug": "x"}}]})
+        write(open_ended / "claude-settings.json", {"env": {"ANTHROPIC_BASE_URL": "https://open-ended"}})
         self.assertEqual(run(self, "use", "custom", "--yes"), 0)
-        self.assertFalse(self.paths["CODEX_MODELS"].exists())
-        self.assertNotIn("model_catalog_json", self.paths["CODEX"].read_text())
+        catalog = json.loads(self.paths["CODEX_MODELS"].read_text())
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["x"])
+        self.assertEqual(ai_switch.top_level_get(self.paths["CODEX"].read_text(), "model_catalog_json"),
+                         "~/.codex/models.json")
+        # a model outside the list is accepted and added to the catalogue
         self.assertEqual(run(self, "use", "custom", "-m", "any-other-model"), 0)
         self.assertIn('model = "any-other-model"', self.paths["CODEX"].read_text())
+        catalog = json.loads(self.paths["CODEX_MODELS"].read_text())
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["x", "any-other-model"])
+        settings = json.loads(self.paths["CLAUDE"].read_text())
+        self.assertEqual(settings["model"], "any-other-model")
+        self.assertEqual(settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "any-other-model")
+        self.assertEqual(settings["env"]["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "any-other-model")
+
+
+class AddCommandTest(unittest.TestCase):
+    """One API key + URL must be able to carry several models."""
+
+    def setUp(self):
+        self.paths = sandbox(self)
+
+    def _add(self, answers):
+        original = sys.stdin
+        sys.stdin = io.StringIO("\n".join(answers) + "\n")
+        try:
+            return run(self, "add")
+        finally:
+            sys.stdin = original
+
+    def test_custom_provider_accepts_several_models(self):
+        code = self._add(["custom", "sk-test", "https://gw.example/v1", "Big-Model Small-Model",
+                          "Small-Model", "gw", "gateway", "both"])
+        self.assertEqual(code, 0)
+        profile = self.paths["PROFILES"] / "gw"
+        catalog = json.loads((profile / "models.json").read_text())
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["Big-Model", "Small-Model"])
+        self.assertEqual(catalog["default"], "Small-Model")
+        self.assertTrue(catalog["open_ended"])
+        published = json.loads((profile / "codex-models.json").read_text())
+        self.assertEqual([m["slug"] for m in published["models"]], ["Big-Model", "Small-Model"])
+        config = (profile / "codex-config.toml").read_text()
+        self.assertIn('model = "Small-Model"', config)
+        self.assertIn('base_url = "https://gw.example/v1"', config)
+        self.assertIn("model_catalog_json", config)
+        settings = json.loads((profile / "claude-settings.json").read_text())
+        self.assertEqual(settings["model"], "Small-Model")
+        self.assertEqual(settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"], "Small-Model")
+        self.assertEqual(settings["env"]["ANTHROPIC_BASE_URL"], "https://gw.example")  # Claude Code adds /v1/messages
+        # switching to the other model moves both agents
+        self.assertEqual(run(self, "use", "gw", "-m", "Big-Model"), 0)
+        self.assertIn('model = "Big-Model"', self.paths["CODEX"].read_text())
+        settings = json.loads(self.paths["CLAUDE"].read_text())
+        self.assertEqual(settings["model"], "Big-Model")
+        self.assertEqual(settings["env"]["CLAUDE_CODE_SUBAGENT_MODEL"], "Big-Model")
+        self.assertEqual(settings["env"]["ANTHROPIC_AUTH_TOKEN"], "sk-test")
+
+    def test_comma_separated_and_preset_subset_still_work(self):
+        code = self._add(["glm", "sk-test", "glm-5.3,glm-5-turbo", "glm-5-turbo", "glm2", "", "both"])
+        self.assertEqual(code, 0)
+        catalog = json.loads((self.paths["PROFILES"] / "glm2" / "models.json").read_text())
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["glm-5.3", "glm-5-turbo"])
+        self.assertEqual(catalog["default"], "glm-5-turbo")
+
+    def test_a_single_model_still_works(self):
+        code = self._add(["custom", "sk-test", "https://gw.example/v1", "One-Model", "one", "", "codex"])
+        self.assertEqual(code, 0)
+        catalog = json.loads((self.paths["PROFILES"] / "one" / "models.json").read_text())
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["One-Model"])
+        self.assertFalse((self.paths["PROFILES"] / "one" / "claude-settings.json").exists())
 
 
 class DoctorTest(unittest.TestCase):
