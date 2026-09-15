@@ -19,11 +19,21 @@ Conversation history is never part of a profile
     ``ai-switch doctor`` reports the real reasons sessions disappear after a
     switch (corrupt runtime SQLite databases, SQLite stored on NFS, disabled
     history persistence, claude/codex running while switching).
+
+Gateways that cannot follow Codex's tool calls
+    A gateway that translates the Responses API into Chat completions may reject
+    the follow-up request of every tool-using turn, because Codex writes an
+    assistant message item between the turn's tool calls and their results.  For
+    such a profile (see GATEWAY_PATCHES) ``ai-switch use`` starts a local proxy
+    that moves that item back in front of the calls, points Codex at it and stops
+    it again on the next switch; ``doctor`` reports it and ``current`` shows it.
 """
-import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, textwrap, time
+import argparse, hashlib, json, os, re, shutil, signal, socket, sqlite3, subprocess, sys, tempfile, \
+    textwrap, threading, time, urllib.error, urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
-VERSION = "0.4.1"
+VERSION = "0.5.0"
 
 # set by --no-color; Style() consults it so every command honours one switch
 COLOR_DISABLED = False
@@ -682,8 +692,12 @@ def build_codex_catalog(d, catalog, include_profile_entries=True):
     return {"models": ordered}
 
 
-def compute_changes(d, slug, pin=False):
-    """Return {path: text-or-None}: None means "remove this stale file"."""
+def compute_changes(d, slug, pin=False, patch_url=None):
+    """Return {path: text-or-None}: None means "remove this stale file".
+
+    ``patch_url`` repoints Codex at the local gateway patch proxy.  It only ever affects
+    the text written to the live config: the profile keeps the provider's real endpoint.
+    """
     changes, notes = {}, []
     catalog = load_catalog(d)
     entry = find_entry(catalog, slug)
@@ -727,6 +741,8 @@ def compute_changes(d, slug, pin=False):
                 text = top_level_set(text, "model_reasoning_effort", entry["reasoning"])
         elif entry:
             text = top_level_set(text, "model", entry["slug"])
+        if patch_url:
+            text = set_provider_base_url(text, patch_url)
         changes[CODEX] = text
     elif (d / "codex-auth.json").exists() or (d / "codex-models.json").exists():
         notes.append("profile has Codex side files but no codex-config.toml")
@@ -892,6 +908,460 @@ def codex_health_warnings(check_codex=True):
     return warnings
 
 
+# ---------------------------------------------------------------- gateway patch
+# Some gateways translate Codex's Responses API into Chat completions, and in doing so
+# break every turn in which Codex writes its assistant ``message`` item *between* the
+# turn's tool calls and their results.  Codex always writes that item - empty when the
+# model said nothing before calling a tool - and a translator that emits it as its own
+# chat message leaves the ``tool_calls`` message without the ``tool`` messages that must
+# follow it directly, so the next request is rejected with "An assistant message with
+# 'tool_calls' must be followed by tool messages" and the session dies.  For a profile
+# whose endpoint behaves that way ``ai-switch use`` starts a small local proxy that moves
+# the message back in front of the calls before forwarding the request, points Codex at
+# it, and stops it again when another profile is activated.
+PATCH_PORT = 8791
+PATCH_HEALTH = "/__ai-switch-patch"
+PATCH_START_TIMEOUT = 10
+PATCH_READ_TIMEOUT = 900
+PATCH_LOG_LIMIT = 1 << 20
+# The proxy process learns where to log from argv: its environment says nothing about
+# this tool's home directory.  The parent leaves this None.
+PATCH_LOG = None
+PATCH_CALL_ITEMS = ("function_call", "custom_tool_call")
+PATCH_RESULT_ITEMS = ("function_call_output", "custom_tool_call_output")
+GATEWAY_PATCHES = {
+    "paratera.com": "Paratera translates Responses into Chat completions and splits a turn's "
+                    "tool calls from their results",
+}
+
+
+def patch_log_path():
+    return ROOT / "patch.log"
+
+
+def _host_without_port(url):
+    return host_of(url).rsplit("@", 1)[-1].split(":")[0].strip().lower()
+
+
+def provider_wire_api(text):
+    """The ``wire_api`` of the profile's provider section (Codex's only mode is responses)."""
+    _, tail = split_toml(text or "")
+    found = re.search(r'(?m)^wire_api[ \t]*=[ \t]*["\']([^"\']+)', tail)
+    return found.group(1) if found else None
+
+
+def gateway_patch_for(base_url):
+    """The patch a profile's endpoint needs, or None - matched on the host suffix."""
+    host = _host_without_port(base_url or "")
+    if not host:
+        return None
+    for suffix, reason in GATEWAY_PATCHES.items():
+        if host == suffix or host.endswith("." + suffix):
+            return {"host": host, "reason": reason}
+    return None
+
+
+def patch_needed(codex_config, base_url=None):
+    """Whether activating this profile has to route Codex through the proxy."""
+    text = codex_config or ""
+    url = _provider_base_url(text) if base_url is None else base_url
+    patch = gateway_patch_for(url) if url else None
+    if patch is None:
+        return None
+    # Only the Responses API is translated by the gateway; a profile that asked for
+    # anything else is forwarded untouched and needs no proxy.
+    return patch if (provider_wire_api(text) or "responses") == "responses" else None
+
+
+def set_provider_base_url(text, url):
+    """Repoint the provider section at the local proxy (the profile keeps the real one)."""
+    head, tail = split_toml(text)
+    replaced, count = re.subn(r'(?m)^(base_url[ \t]*=[ \t]*)(["\'])[^"\']*\2',
+                              lambda match: match.group(1) + match.group(2) + url + match.group(2),
+                              tail, count=1)
+    if not count:
+        return text
+    return head + replaced
+
+
+def _message_text(item):
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    return "".join(part.get("text", "") for part in content if isinstance(part, dict))
+
+
+def rewrite_tool_items(items):
+    """Move a tool turn's assistant message in front of the turn's calls.
+
+    Returns ``(items, moved, dropped)``: the reordered list, how many messages were moved
+    and how many empty ones were removed.  Anything that is not exactly
+    ``calls + assistant message + results`` is left untouched.
+    """
+    if not isinstance(items, list):
+        return items, 0, 0
+    out, moved, dropped, index = [], 0, 0, 0
+    while index < len(items):
+        item = items[index]
+        if not isinstance(item, dict) or item.get("type") not in PATCH_CALL_ITEMS:
+            out.append(item)
+            index += 1
+            continue
+        end = index
+        while end < len(items) and isinstance(items[end], dict) \
+                and items[end].get("type") in PATCH_CALL_ITEMS:
+            end += 1
+        calls = items[index:end]
+        after = end
+        messages = []
+        while after < len(items) and isinstance(items[after], dict) \
+                and items[after].get("type") == "message" and items[after].get("role") == "assistant":
+            messages.append(items[after])
+            after += 1
+        completed = after < len(items) and isinstance(items[after], dict) \
+            and items[after].get("type") in PATCH_RESULT_ITEMS
+        if messages and completed:
+            for message in messages:
+                if _message_text(message).strip():
+                    out.append(message)
+                    moved += 1
+                else:
+                    dropped += 1
+            out.extend(calls)
+            index = after
+            continue
+        out.extend(calls)
+        index = end
+    return out, moved, dropped
+
+
+class PatchHandler(BaseHTTPRequestHandler):
+    """Forwards to the real endpoint, rewriting ``/responses`` bodies on the way through."""
+
+    protocol_version = "HTTP/1.1"
+    # Hop-by-hop headers plus anything that would misdescribe the body we send upstream.
+    STRIPPED = ("host", "content-length", "connection", "transfer-encoding", "content-encoding",
+                "accept-encoding", "expect")
+
+    def log_message(self, *args):
+        pass                      # never log request lines: they carry the API key
+
+    def _reply_json(self, payload, status=200):
+        body = json.dumps(payload).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.rstrip("/") == PATCH_HEALTH:
+            self._reply_json({"ai_switch_patch": VERSION, "pid": os.getpid(),
+                              "upstream": self.server.upstream})
+            return
+        self.forward("GET")
+
+    def do_POST(self):
+        self.forward("POST")
+
+    def read_body(self):
+        """The request body, whether the client sent a length or chunked it."""
+        if "chunked" in (self.headers.get("Transfer-Encoding") or "").lower():
+            parts = []
+            while True:
+                size = int(self.rfile.readline(65536).split(b";")[0].strip() or b"0", 16)
+                if not size:
+                    self.rfile.readline(65536)          # the trailer's blank line
+                    break
+                parts.append(self.rfile.read(size))
+                self.rfile.read(2)                      # CRLF after the chunk
+            return b"".join(parts)
+        length = int(self.headers.get("Content-Length") or 0)
+        return self.rfile.read(length) if length else b""
+
+    def patched_body(self, body):
+        try:
+            document = json.loads(body)
+        except ValueError:
+            return body, 0, 0
+        if not isinstance(document, dict) or not isinstance(document.get("input"), list):
+            return body, 0, 0
+        items, moved, dropped = rewrite_tool_items(document["input"])
+        if not moved and not dropped:
+            return body, 0, 0
+        document["input"] = items
+        return json.dumps(document).encode(), moved, dropped
+
+    def forward(self, method):
+        body = self.read_body()
+        moved = dropped = 0
+        if body and self.path.split("?")[0].rstrip("/").endswith("/responses"):
+            body, moved, dropped = self.patched_body(body)
+        headers = {key: value for key, value in self.headers.items()
+                   if key.lower() not in self.STRIPPED}
+        headers.setdefault("User-Agent", f"ai-switch/{VERSION}")
+        request = urllib.request.Request(self.server.upstream + self.path,
+                                         data=body or None, headers=headers, method=method)
+        try:
+            response = urllib.request.urlopen(request, timeout=PATCH_READ_TIMEOUT)
+        except urllib.error.HTTPError as error:
+            response = error
+        except Exception as error:                      # upstream unreachable, DNS, timeout
+            patch_log(f"upstream unreachable: {type(error).__name__}: {error}")
+            try:
+                self._reply_json({"error": {"message": f"ai-switch patch proxy: {error}"}}, status=502)
+            except OSError:
+                pass
+            return
+        patch_log(f"{method} {self.path} items edited: moved={moved} dropped={dropped} "
+                  f"-> {getattr(response, 'status', '?')}")
+        try:
+            self.relay(response)
+        except OSError:                                  # the agent hung up mid-stream
+            pass
+        finally:
+            response.close()
+
+    def relay(self, response):
+        status = getattr(response, "status", 200)
+        headers = response.headers
+        self.send_response(status)
+        for name in ("Content-Type", "Content-Encoding"):
+            value = headers.get(name)
+            if value:
+                self.send_header(name, value)
+        length = headers.get("Content-Length")
+        if length is not None:
+            self.send_header("Content-Length", length)
+            self.end_headers()
+            while True:
+                chunk = response.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+            return
+        # Streaming (SSE) arrives without a length: chunked, flushed as it comes, and the
+        # connection is closed afterwards rather than left half-open.
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Connection", "close")
+        self.close_connection = True
+        self.end_headers()
+        while True:
+            chunk = response.read(2048)
+            if not chunk:
+                break
+            self.wfile.write(b"%x\r\n" % len(chunk) + chunk + b"\r\n")
+            self.wfile.flush()
+        self.wfile.write(b"0\r\n\r\n")
+        self.wfile.flush()
+
+
+def patch_log(line):
+    path = PATCH_LOG or patch_log_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as handle:
+            handle.write(f"{timestamp()} {line}\n")
+    except OSError:
+        pass
+
+
+def shim_main(argv):
+    """Entry point of the proxy process: ``shim_main([port, upstream, logfile?])``."""
+    global PATCH_LOG
+    if len(argv) < 2:
+        print("usage: ai_switch.shim_main PORT UPSTREAM [LOGFILE]", file=sys.stderr)
+        return 2
+    port, upstream = int(argv[0]), argv[1].rstrip("/")
+    if len(argv) > 2:
+        PATCH_LOG = Path(argv[2])
+    trim_patch_log(PATCH_LOG or patch_log_path())
+    server = ThreadingHTTPServer(("127.0.0.1", port), PatchHandler)
+    server.daemon_threads = True
+    server.upstream = upstream
+    patch_log(f"patch proxy listening on 127.0.0.1:{port} -> {upstream} (pid {os.getpid()})")
+    signal.signal(signal.SIGTERM, lambda *_: threading.Thread(target=server.shutdown, daemon=True).start())
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    server.serve_forever()
+    patch_log("patch proxy stopped")
+    return 0
+
+
+def trim_patch_log(path):
+    try:
+        if path.exists() and path.stat().st_size > PATCH_LOG_LIMIT:
+            path.replace(path.parent / (path.name + ".1"))
+    except OSError:
+        pass
+
+
+def patch_health(port, timeout=0.6):
+    """The proxy's own status endpoint, which also proves it is the one we started."""
+    if not port:
+        return None
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{int(port)}{PATCH_HEALTH}",
+                                    timeout=timeout) as response:
+            payload = json.loads(response.read())
+    except (OSError, ValueError, TypeError):
+        return None
+    return payload if isinstance(payload, dict) and payload.get("ai_switch_patch") else None
+
+
+def patch_record():
+    record = load_state().get("patch")
+    return record if isinstance(record, dict) else {}
+
+
+def remember_patch(record):
+    state = load_state()
+    if record:
+        state["patch"] = record
+    else:
+        state.pop("patch", None)
+    save_state(state)
+
+
+def patch_status():
+    """What the proxy is doing now: ``running``, its port and the endpoint it serves."""
+    record = patch_record()
+    health = patch_health(record.get("port"))
+    if not health:
+        return {"running": False, "port": record.get("port"), "upstream": record.get("upstream"),
+                "stale": bool(record)}
+    return {"running": True, "port": record.get("port"), "pid": health.get("pid"),
+            "upstream": health.get("upstream") or record.get("upstream"), "stale": False}
+
+
+def wait_for_patch(port, timeout=PATCH_START_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if patch_health(port, timeout=0.5):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def free_patch_port(preferred=PATCH_PORT):
+    """The preferred port, or whatever the OS hands out when something else holds it."""
+    for candidate in (preferred, 0):
+        try:
+            with socket.socket() as probe:
+                # The proxy binds with SO_REUSEADDR too, so probe the same way: a port its
+                # own previous instance left in TIME_WAIT is still usable, and one that
+                # another process is listening on is not.
+                probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                probe.bind(("127.0.0.1", candidate))
+                port = probe.getsockname()[1]
+            if port:
+                return port
+        except OSError:
+            continue
+    raise OSError("no free TCP port on 127.0.0.1 for the gateway patch")
+
+
+def start_patch(upstream):
+    """Launch the proxy for ``upstream`` and wait until it answers; returns its record."""
+    log_path = patch_log_path()
+    trim_patch_log(log_path)
+    port = free_patch_port()
+    bootstrap = ("import sys; sys.path.insert(0, sys.argv[1]); "
+                 "from ai_switch import shim_main; sys.exit(shim_main(sys.argv[2:]))")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    secure(log_path.parent)
+    with open(log_path, "ab") as sink:
+        process = subprocess.Popen(
+            [sys.executable, "-c", bootstrap, str(Path(__file__).resolve().parent),
+             str(port), upstream, str(log_path)],
+            stdin=subprocess.DEVNULL, stdout=sink, stderr=sink, start_new_session=True)
+    if not wait_for_patch(port):
+        stop_process(process)
+        raise ValueError(f"the gateway patch proxy did not come up on 127.0.0.1:{port}; "
+                         f"see {display_path(log_path)}")
+    record = {"pid": process.pid, "port": port, "upstream": upstream, "version": VERSION,
+              "started": timestamp()}
+    remember_patch(record)
+    return record
+
+
+def stop_process(process):
+    try:
+        process.terminate()
+        process.wait(timeout=3)
+    except (OSError, subprocess.TimeoutExpired):
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def stop_patch():
+    """Stop the proxy - whether or not state.json still remembers it. Returns its ports."""
+    ports = []
+    for record in (patch_record(), {"port": PATCH_PORT}):
+        port = record.get("port")
+        health = patch_health(port)
+        pid = (health or {}).get("pid")
+        if not pid or pid == os.getpid():
+            continue
+        try:
+            os.kill(int(pid), signal.SIGTERM)
+        except (OSError, ValueError):
+            continue
+        ports.append(port)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            if not patch_health(port, timeout=0.2):
+                break
+            time.sleep(0.05)
+        else:
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+    if patch_record():
+        remember_patch(None)
+    return ports
+
+
+def activate_patch_for(d, name, dry_run=False, enabled=True):
+    """Decide the proxy's fate for the profile being activated.
+
+    Returns the base URL Codex should use, or None to leave the profile's own endpoint in
+    place.  A running proxy for the same endpoint is reused; one for a different endpoint,
+    from another version, or no longer wanted is stopped first.
+    """
+    codex_config = read_text(d / "codex-config.toml") or ""
+    patch = patch_needed(codex_config) if enabled else None
+    if patch is None:
+        if dry_run:
+            live = patch_status()
+            if live["running"]:
+                print(f"dry-run: would stop the gateway patch proxy on 127.0.0.1:{live['port']}",
+                      file=sys.stderr)
+            return None
+        for port in stop_patch():
+            print(f"Note: stopped the gateway patch proxy on 127.0.0.1:{port}; '{name}' does "
+                  "not need it.", file=sys.stderr)
+        return None
+    if dry_run:
+        record = patch_record() if patch_status()["running"] else {}
+        print(f"dry-run: would route Codex through the {patch['host']} patch proxy on "
+              f"127.0.0.1:{record.get('port') or PATCH_PORT}", file=sys.stderr)
+        return f"http://127.0.0.1:{record.get('port') or PATCH_PORT}"
+    upstream = _provider_base_url(codex_config)
+    record, live = patch_record(), patch_status()
+    if live["running"] and record.get("upstream") == upstream and record.get("version") == VERSION:
+        return f"http://127.0.0.1:{live['port']}"
+    if live["running"] or record:
+        stop_patch()
+    record = start_patch(upstream)
+    print(f"Note: Codex will use the {patch['host']} patch proxy on 127.0.0.1:{record['port']} "
+          f"({patch['reason']}).", file=sys.stderr)
+    return f"http://127.0.0.1:{record['port']}"
+
+
 def cmd_use(args):
     name = args.name
     d = profile(name)
@@ -916,7 +1386,9 @@ def cmd_use(args):
         slug = pick_model(catalog, None, fallback, force=True)
     if slug and catalog is None:
         print(f"Note: profile '{name}' has no model list, using '{slug}' as-is.", file=sys.stderr)
-    changes, notes = compute_changes(d, slug, pin=args.pin)
+    patch_url = activate_patch_for(d, name, dry_run=args.dry_run,
+                                   enabled=not getattr(args, "no_patch", False))
+    changes, notes = compute_changes(d, slug, pin=args.pin, patch_url=patch_url)
     for note in notes:
         print(f"Note: {note}", file=sys.stderr)
     plain = getattr(args, "plain", False)
@@ -1156,6 +1628,13 @@ def cmd_current(args):
                 live.append(style(f"live Codex config uses {live_model}", "grey"))
             if published and catalog and published != len(catalog["models"]):
                 live.append(style(f"{published} model(s) published to {display_path(CODEX_MODELS)}", "grey"))
+            proxy = patch_status()
+            if proxy["running"]:
+                live.append(style(f"gateway patch proxy on 127.0.0.1:{proxy['port']} → "
+                                  f"{proxy.get('upstream')}", "grey"))
+            elif proxy.get("stale"):
+                live.append(style("gateway patch proxy is not running - re-run "
+                                  f"'ai-switch use {name}' to restart it", "yellow"))
             for line in live:
                 print(f"      {style('state ', 'grey')}  {line}")
         print()
@@ -1530,6 +2009,30 @@ def check_report():
     else:
         add("ok", "Codex model catalogue", "not used by the current configuration")
 
+    # A gateway that needs the rewrite is only helped while Codex is actually routed
+    # through the proxy, so report the two ways that link can be broken.
+    name = active_profile()
+    wants = patch_needed(read_text(PROFILES / name / "codex-config.toml") or "") if name else None
+    proxy = patch_status()
+    port = proxy.get("port") or PATCH_PORT
+    if wants and _host_without_port(_provider_base_url(text) or "") in ("127.0.0.1", "localhost"):
+        if proxy["running"]:
+            add("ok", "gateway patch proxy", f"127.0.0.1:{proxy['port']} -> {proxy.get('upstream')}")
+        else:
+            add("fail", "gateway patch proxy is not running",
+                f"{display_path(CODEX)} points at 127.0.0.1:{port}, but nothing answers there",
+                f"Restart it with 'ai-switch use {name}'. Until then Codex cannot reach {wants['host']}.")
+    elif wants:
+        add("warn", "gateway patch proxy is not in the way",
+            f"{display_path(CODEX)} still points at {_provider_base_url(text) or 'the provider'}",
+            f"{wants['host']} {wants['reason']}, so tool calls fail with \"insufficient tool "
+            f"messages following tool_calls\". Run 'ai-switch use {name}' to route Codex through "
+            "the proxy.")
+    elif proxy["running"]:
+        add("warn", "gateway patch proxy is still running",
+            f"127.0.0.1:{proxy['port']} -> {proxy.get('upstream')}",
+            "The active profile does not need it; the next 'ai-switch use' stops it.")
+
     databases = sorted(CODEX_DIR.glob("*.sqlite"))
     broken = []
     for db in databases:
@@ -1704,6 +2207,9 @@ files inside a profile are switched. Restart claude/codex after switching."""
     p.add_argument("-y", "--yes", action="store_true", help="accepted for compatibility; use never prompts by default")
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
     p.add_argument("--no-check", action="store_true", help="skip the session-history health check")
+    p.add_argument("--no-patch", action="store_true",
+                   help="do not route Codex through the local gateway patch proxy "
+                        "(for endpoints that no longer need it)")
     p.set_defaults(fn=cmd_use)
 
     p = sub.add_parser("models", help="show the models a profile offers")

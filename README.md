@@ -188,6 +188,32 @@ ai-switch use deepseek -m deepseek-flash
 
 Model suffixes are proxy-specific: DeepSeek's Claude endpoint accepts and strips a `[1m]` marker (`deepseek-v4-pro[1m]`), while ZAI rejects it as an unknown model — `glm-5.3` is already 1M context and must be used without a suffix. Worth a one-token request before trusting a name in a profile.
 
+## Gateways that break Codex's tool calls
+
+Codex 0.154 records an assistant `message` item **between** a turn's tool calls and their results — the text it said before calling the tools, or an empty string when it said nothing. That is valid in the Responses API, but a gateway that translates Responses into Chat completions emits it as its own chat message, which leaves the `tool_calls` message without the `tool` messages that must follow it directly. The next request is then rejected and the session dies:
+
+```text
+OpenAIException - The request is invalid: An assistant message with 'tool_calls' must be
+followed by tool messages responding to each 'tool_call_id'. (insufficient tool messages
+following tool_calls message)
+```
+
+Paratera (`llmapi.paratera.com`) does this. Claude Code is unaffected, because it speaks the Anthropic API rather than the Responses API — only Codex hits the translation.
+
+For such a profile, `ai-switch use` starts a small local proxy that moves that message back in front of the calls, points Codex at it, and stops it again when you activate a profile that does not need it:
+
+```text
+Note: Codex will use the llmapi.paratera.com patch proxy on 127.0.0.1:8791
+      (Paratera translates Responses into Chat completions and splits a turn's tool calls from their results).
+```
+
+* The profile keeps the provider's real endpoint. Only the live `~/.codex/config.toml` is repointed, and only Codex's own configuration — Claude Code still talks to the provider directly.
+* The proxy listens on `127.0.0.1` only, forwards your key and your request body untouched apart from the item order, and logs counts and status codes (never keys, prompts or answers) to `~/.config/ai-switch/patch.log`.
+* If the process dies (a reboot, a kill), Codex cannot reach its endpoint. `ai-switch doctor` reports it and `ai-switch use NAME` starts it again. `ai-switch current` shows whether it is up.
+* Nothing here is needed once the gateway's translation is fixed: `ai-switch use NAME --no-patch` activates the profile without the proxy and stops it if it is running.
+
+This is a workaround for the gateway, not a fix — the rewriting is deliberately narrow (only a completed `calls + message + results` turn, only on `/responses`), and anything else is forwarded byte for byte.
+
 ## Session history
 
 Conversation history belongs to the agents, not to a provider, so ai-switch never manages it. These files are deliberately excluded from profiles and switches:
@@ -222,7 +248,7 @@ ai-switch doctor --fix    # quarantine damaged Codex runtime databases
 
 ## Safety and storage
 
-Before activation, the current Codex and Claude files are backed up under `~/.config/ai-switch/backups/<timestamp>/` (files that a switch removes are kept under `removed/`). Profiles are stored under `~/.config/ai-switch/profiles/`; directories use mode 700 and files use mode 600. The active profile and the last used model are recorded in `~/.config/ai-switch/state.json`. Restart `claude` or `codex` after switching so the process reloads its configuration.
+Before activation, the current Codex and Claude files are backed up under `~/.config/ai-switch/backups/<timestamp>/` (files that a switch removes are kept under `removed/`). Profiles are stored under `~/.config/ai-switch/profiles/`; directories use mode 700 and files use mode 600. The active profile, the last used model and the running gateway patch proxy (pid, port, endpoint) are recorded in `~/.config/ai-switch/state.json`; that proxy's log is `~/.config/ai-switch/patch.log`. Restart `claude` or `codex` after switching so the process reloads its configuration.
 
 Set `AI_SWITCH_HOME` to use a different profile directory, `CODEX_HOME`/`CLAUDE_CONFIG_DIR` for relocated agent configurations, and `AI_SWITCH_API_KEY` to fill the API key prompt non-interactively.
 
@@ -231,7 +257,7 @@ Set `AI_SWITCH_HOME` to use a different profile directory, `CODEX_HOME`/`CLAUDE_
 ```text
 ai-switch init NAME [-d DESCRIPTION]  Save current files as a new profile
 ai-switch list                        List profiles and configuration summaries
-ai-switch use NAME [-m MODEL] [--choose] [--pin] [--plain]
+ai-switch use NAME [-m MODEL] [--choose] [--pin] [--plain] [--no-patch]
                                       Back up and activate a profile (animated, -m sets the default)
 ai-switch models [NAME] [--json]      Show the models a profile offers
 ai-switch current [-p]                Show every profile, its models and the live state (-p: name only)
