@@ -23,7 +23,7 @@ Conversation history is never part of a profile
 import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 
 def _env_path(name, default):
@@ -517,16 +517,17 @@ def catalog_target(text, catalog_path):
     return catalog_path
 
 
-def build_codex_catalog(d, catalog):
+def build_codex_catalog(d, catalog, include_profile_entries=True):
     """Union of the profile's catalog file and every selectable model entry."""
     entries = {}
-    try:
-        raw = json.loads((d / "codex-models.json").read_text())
-        for entry in (raw.get("models") if isinstance(raw, dict) else raw) or []:
-            if isinstance(entry, dict) and entry.get("slug"):
-                entries[entry["slug"]] = entry
-    except (OSError, ValueError, AttributeError):
-        pass
+    if include_profile_entries:
+        try:
+            raw = json.loads((d / "codex-models.json").read_text())
+            for entry in (raw.get("models") if isinstance(raw, dict) else raw) or []:
+                if isinstance(entry, dict) and entry.get("slug"):
+                    entries[entry["slug"]] = entry
+        except (OSError, ValueError, AttributeError):
+            pass
     for entry in catalog["models"]:
         if isinstance(entry.get("codex"), dict):
             entries[entry["slug"]] = entry["codex"]
@@ -537,7 +538,7 @@ def build_codex_catalog(d, catalog):
     return {"models": ordered}
 
 
-def compute_changes(d, slug):
+def compute_changes(d, slug, pin=False):
     """Return {path: text-or-None}: None means "remove this stale file"."""
     changes, notes = {}, []
     catalog = load_catalog(d)
@@ -556,9 +557,14 @@ def compute_changes(d, slug):
             catalog = dict(catalog, models=catalog["models"] + [entry])
     if text is not None:
         # Every profile publishes its models, so the picker inside Codex lists
-        # them too.
+        # them too.  --pin publishes only the activated one, which removes the
+        # other entries from Codex's own picker.
         if catalog:
-            codex_catalog = build_codex_catalog(d, catalog)
+            if pin and entry:
+                codex_catalog = build_codex_catalog(d, dict(catalog, models=[entry]),
+                                                    include_profile_entries=False)
+            else:
+                codex_catalog = build_codex_catalog(d, catalog)
         if codex_catalog is not None:
             catalog_path = catalog_target(text, CODEX_MODELS)
             changes[catalog_path] = json.dumps(codex_catalog, indent=2) + "\n"
@@ -705,12 +711,14 @@ def cmd_use(args):
         slug = pick_model(catalog, args.model, fallback, assume_yes=args.yes)
     if slug and catalog is None:
         print(f"Note: profile '{name}' has no model list, using '{slug}' as-is.", file=sys.stderr)
-    changes, notes = compute_changes(d, slug)
+    changes, notes = compute_changes(d, slug, pin=args.pin)
     for note in notes:
         print(f"Note: {note}", file=sys.stderr)
     backup = apply_changes(changes, name, slug, dry_run=args.dry_run)
     if not args.dry_run:
         print(f"Active profile: {name}" + (f"\nActive model: {slug}" if slug else ""))
+        if args.pin and slug:
+            print(f"Pinned: only '{slug}' is published, so Codex cannot switch to another model.")
         print(f"Backup: {backup}" if backup else "Backup: nothing to back up (no files existed yet)")
         print("Restart claude/codex so they reload their configuration.")
         if not args.no_check:
@@ -1273,9 +1281,24 @@ def check_report():
         f"{len(transcripts)} transcript(s) under {display_path(projects)}")
 
     state = load_state()
-    add("ok", "Active profile", f"{active_profile() or '(none)'}"
-        + (f", model {state.get('models', {}).get(active_profile())}" if isinstance(state.get("models"), dict)
-           and state.get("models", {}).get(active_profile()) else ""))
+    active = active_profile()
+    recorded = (state.get("models") or {}).get(active) if isinstance(state.get("models"), dict) else None
+    add("ok", "Active profile", f"{active or '(none)'}" + (f", model {recorded}" if recorded else ""))
+    if recorded:
+        # A running agent rewrites its own config on exit, so the live files can
+        # silently diverge from what 'ai-switch use' activated.
+        if model and model != recorded:
+            add("warn", "Codex is not using the model ai-switch activated",
+                f"config.toml has model = {model}, ai-switch activated {recorded}",
+                "A running codex session rewrites config.toml when it exits, so a /model choice made "
+                f"inside codex wins. Close codex and re-run 'ai-switch use {active} -m {recorded}', or use "
+                "--pin so the in-app picker cannot switch away.")
+        claude_model = str(settings.get("model") or "")
+        stem = lambda text: re.split(r"[\[/]", text)[0]
+        if claude_model and stem(claude_model) != stem(str(recorded)):
+            add("warn", "Claude Code is not using the model ai-switch activated",
+                f"settings.json has model = {claude_model}, ai-switch activated {recorded}",
+                f"Re-run 'ai-switch use {active} -m {recorded}' to bring both agents back in sync.")
     profiles = [p.name for p in sorted(PROFILES.iterdir()) if p.is_dir()] if PROFILES.exists() else []
     add("ok" if profiles else "note", "Profiles", ", ".join(profiles) or "none yet")
 
@@ -1366,6 +1389,8 @@ files inside a profile are switched. Restart claude/codex after switching."""
     p = sub.add_parser("use", help="activate a profile (optionally choosing a model)")
     p.add_argument("name")
     p.add_argument("-m", "--model", help="model to activate (name, unique prefix, or 1-based index)")
+    p.add_argument("--pin", action="store_true",
+                   help="publish only this model, so Codex's own picker cannot switch to another one")
     p.add_argument("-y", "--yes", action="store_true", help="never prompt; use the default model")
     p.add_argument("-n", "--dry-run", action="store_true", help="show what would change")
     p.add_argument("--no-check", action="store_true", help="skip the session-history health check")

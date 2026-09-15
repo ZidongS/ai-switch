@@ -235,6 +235,17 @@ class UseTest(unittest.TestCase):
         self.assertIn("config.toml", names)
         self.assertIn("settings.json", names)
 
+    def test_pin_publishes_only_the_activated_model(self):
+        self.assertEqual(run(self, "use", "p", "-m", "m-two", "--pin"), 0)
+        catalog = json.loads(self.paths["CODEX_MODELS"].read_text())
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["m-two"])
+        self.assertIn('model = "m-two"', self.paths["CODEX"].read_text())
+        self.assertIn("Pinned", self.out)
+        # without --pin the whole menu comes back
+        self.assertEqual(run(self, "use", "p", "-m", "m-one"), 0)
+        catalog = json.loads(self.paths["CODEX_MODELS"].read_text())
+        self.assertEqual([m["slug"] for m in catalog["models"]], ["m-one", "m-two"])
+
     def test_dry_run_changes_nothing(self):
         original = self.paths["CODEX"].read_text()
         self.assertEqual(run(self, "use", "p", "-m", "m-two", "--dry-run"), 0)
@@ -409,6 +420,16 @@ class DoctorTest(unittest.TestCase):
         write(self.paths["CODEX"], 'model = "ghost"\nmodel_catalog_json = "~/.codex/models.json"\n')
         self.assertEqual(run(self, "doctor"), 1)
         self.assertIn("does not contain the configured model", self.out)
+
+    def test_drift_between_ai_switch_state_and_codex_config_is_reported(self):
+        write(self.paths["CODEX"], 'model = "other-model"\nmodel_catalog_json = "~/.codex/models.json"\n')
+        write(self.paths["PROFILES"] / "p" / "models.json",
+              {"version": 2, "default": "m", "models": [{"slug": "m", "codex": {"slug": "m"}}]})
+        ai_switch.save_state({"profile": "p", "models": {"p": "m"}, "files": {}})
+        write(self.paths["CURRENT"], "p\n")
+        run(self, "doctor")
+        self.assertIn("not using the model ai-switch activated", self.out)
+        self.assertIn("re-run 'ai-switch use p -m m'", self.out.lower())
 
     def test_pinned_claude_model_is_reported(self):
         write(self.paths["CLAUDE"], {"env": {"ANTHROPIC_MODEL": "pinned", "ANTHROPIC_BASE_URL": "https://x"}})

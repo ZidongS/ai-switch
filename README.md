@@ -79,7 +79,10 @@ For scripts and servers, choose without prompting (name, unique prefix, or index
 ai-switch use glm --model glm-5.3-flash
 ai-switch use glm -m 2 -y
 ai-switch use glm --dry-run          # show what would change
+ai-switch use glm -m glm-5.3 --pin   # publish only this model (see below)
 ```
+
+Selecting a model sets the **default for new sessions** in both agents, and the profile's other models stay in the catalogue so you can still switch inside the agent. That means an in-app `/model` choice is a per-session override — and Codex writes its own choice back to `~/.codex/config.toml` when it exits, so the two agents can drift apart without anything else noticing; `ai-switch doctor` reports exactly that. If you want an activation to be exclusive instead, add `--pin`: the published catalogue then holds only the selected model, so Codex's own picker has nothing else to switch to (the next `ai-switch use` without `--pin` restores the full menu).
 
 Edit `~/.codex/config.toml` and `~/.claude/settings.json` for another provider, then save that configuration as a second profile:
 
