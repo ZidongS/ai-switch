@@ -23,7 +23,7 @@ Conversation history is never part of a profile
 import argparse, hashlib, json, os, re, shutil, sqlite3, sys, tempfile, time
 from pathlib import Path
 
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 
 
 def _env_path(name, default):
@@ -1164,6 +1164,53 @@ def running_agents_summary(limit=4):
     return ", ".join(running[:limit]) + f" and {len(running) - limit} more"
 
 
+TOOL_CALL_TYPES = ("function_call", "custom_tool_call", "local_shell_call")
+TOOL_OUTPUT_TYPES = ("function_call_output", "custom_tool_call_output", "local_shell_call_output")
+
+
+def recent_rollouts(limit=8):
+    sessions = CODEX_DIR / "sessions"
+    if not sessions.is_dir():
+        return []
+    paths = [p for p in sessions.glob("**/*.jsonl") if p.is_file() and p.stat().st_size < 32 * 1024 * 1024]
+    return sorted(paths, key=lambda p: p.stat().st_mtime, reverse=True)[:limit]
+
+
+def unmatched_tool_calls(paths):
+    """Find assistant tool calls without a tool reply: that breaks the next request.
+
+    Returns [(path, when, count, sample_call_id)] newest first. A cancelled or
+    aborted command is the usual cause; Codex replays the whole history, and a
+    gateway that converts an incomplete pair to chat tool_calls is rejected by its
+    upstream provider ("insufficient tool messages following tool_calls message").
+    """
+    broken = []
+    for path in paths:
+        calls, outputs = {}, set()
+        try:
+            lines = path.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue
+            payload = record.get("payload") if isinstance(record.get("payload"), dict) else record
+            kind, call_id = payload.get("type"), payload.get("call_id")
+            if not call_id:
+                continue
+            if kind in TOOL_CALL_TYPES:
+                calls[call_id] = payload.get("name") or ""
+            elif kind in TOOL_OUTPUT_TYPES:
+                outputs.add(call_id)
+        missing = [call_id for call_id in calls if call_id not in outputs]
+        if missing:
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(path.stat().st_mtime))
+            broken.append((path, when, len(missing), calls[missing[0]], missing[0]))
+    return broken
+
+
 def check_report():
     checks = []
 
@@ -1260,6 +1307,19 @@ def check_report():
             "Run 'codex resume --all' to list sessions from every directory ('codex resume' filters by cwd).")
     else:
         add("note", "Codex rollout files", "none found", "Sessions start once you use codex.")
+    checked = recent_rollouts()
+    broken_sessions = unmatched_tool_calls(checked)
+    if broken_sessions:
+        path, when, count, tool, call_id = broken_sessions[0]
+        add("warn", f"{len(broken_sessions)} recent session(s) contain an unmatched tool call",
+            f"{when}: {count} call(s) without a reply in {path.name} "
+            f"(e.g. {tool or 'tool'} {call_id})",
+            "A cancelled or aborted command leaves an assistant tool call without its output. Codex replays "
+            "the whole history, so the next request can fail with 'tool_calls must be followed by tool "
+            "messages' on gateways that rewrite the conversation. Run /compact in that session, fork it "
+            "('codex fork'), or start a new one before continuing.")
+    elif checked:
+        add("ok", "Recent Codex sessions", f"{len(checked)} session(s) checked, every tool call has a reply")
     for name in ("history.jsonl", "session_index.jsonl"):
         path = CODEX_DIR / name
         add("ok" if path.exists() else "note", f"Codex {name}",
